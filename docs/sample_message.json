@@ -1,0 +1,28 @@
+{
+  "message_id": "20220417_000442_1_WLINE_01_04_PROD_001:L01:LA:000000",
+  "product_instance_id": "20220417_000442_1_WLINE_01_04_PROD_001",
+  "product_id": "PROD_001",
+  "line_id": "WLINE_01",
+  "batch_id": "04",
+  "sequence_id": "1",
+  "lead_num": 1,
+  "lead_type": "AL_CU",
+  "channel": 0,
+  "channel_name": "LaserA",
+  "chunk_index": 0,
+  "total_chunks": 4,
+  "is_last_chunk": false,
+  "sample_rate_hz": 25000,
+  "start_sample": 0,
+  "end_sample": 5000,
+  "samples": [0.000028, 0.000351, 0.000674, -0.000295],
+  "event_time": "2022-04-17T00:04:42Z",
+  "metadata": {
+    "source": "file_replay_producer",
+    "version": "v1",
+    "file_name": "20220417_000442_1_WLINE_01_04_PROD_001_01_LA.csv",
+    "original_product_instance_id": "20220417_000442_1_WLINE_01_04_PROD_001",
+    "is_duplicate": false,
+    "replay_iteration": 0
+  }
+}

@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.env
+.venv/
+venv/
+data/
+models/
+logs/
+*.zip
+.DS_Store
+
+# Sensitive Data Mapping
+docs/internal_mapping.md

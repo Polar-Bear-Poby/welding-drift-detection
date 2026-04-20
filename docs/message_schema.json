@@ -1,0 +1,123 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "welding.raw.v1 message",
+  "type": "object",
+  "required": [
+    "message_id",
+    "product_instance_id",
+    "product_id",
+    "line_id",
+    "lead_num",
+    "lead_type",
+    "channel",
+    "chunk_index",
+    "total_chunks",
+    "is_last_chunk",
+    "sample_rate_hz",
+    "samples",
+    "event_time",
+    "metadata"
+  ],
+  "properties": {
+    "message_id": {
+      "type": "string",
+      "description": "Deterministic id: product_instance_id + lead + channel + chunk index"
+    },
+    "product_instance_id": {
+      "type": "string",
+      "description": "Unique production instance id generated from date/time/seq/line/batch/product_id"
+    },
+    "product_id": {
+      "type": "string"
+    },
+    "line_id": {
+      "type": "string"
+    },
+    "batch_id": {
+      "type": "string"
+    },
+    "sequence_id": {
+      "type": "string"
+    },
+    "lead_num": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 16
+    },
+    "lead_type": {
+      "type": "string",
+      "enum": ["AL_CU", "CU_CU"]
+    },
+    "channel": {
+      "type": "integer",
+      "enum": [0, 1],
+      "description": "0=LaserA, 1=LaserB"
+    },
+    "channel_name": {
+      "type": "string",
+      "enum": ["LaserA", "LaserB"]
+    },
+    "chunk_index": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "total_chunks": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "is_last_chunk": {
+      "type": "boolean"
+    },
+    "sample_rate_hz": {
+      "type": "integer",
+      "const": 25000
+    },
+    "start_sample": {
+      "type": "integer"
+    },
+    "end_sample": {
+      "type": "integer"
+    },
+    "samples": {
+      "type": "array",
+      "items": {
+        "type": "number"
+      }
+    },
+    "event_time": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "metadata": {
+      "type": "object",
+      "required": [
+        "source",
+        "version",
+        "file_name",
+        "original_product_instance_id",
+        "is_duplicate",
+        "replay_iteration"
+      ],
+      "properties": {
+        "source": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        },
+        "file_name": {
+          "type": "string"
+        },
+        "original_product_instance_id": {
+          "type": "string"
+        },
+        "is_duplicate": {
+          "type": "boolean"
+        },
+        "replay_iteration": {
+          "type": "integer"
+        }
+      }
+    }
+  }
+}

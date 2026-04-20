@@ -1,0 +1,156 @@
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.3
+    container_name: welding-zookeeper
+    restart: unless-stopped
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    volumes:
+      - zk-data:/var/lib/zookeeper/data
+      - zk-log:/var/lib/zookeeper/log
+    networks:
+      - welding-net
+    healthcheck:
+      test: ["CMD-SHELL", "echo ruok | nc localhost 2181 | grep imok"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.3
+    container_name: welding-kafka
+    restart: unless-stopped
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:9092,EXTERNAL://0.0.0.0:29092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://${KAFKA_EXTERNAL_HOST:-localhost}:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_NUM_PARTITIONS: 8
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 1
+      KAFKA_MESSAGE_MAX_BYTES: 5242880
+      KAFKA_REPLICA_FETCH_MAX_BYTES: 5242880
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_LOG_SEGMENT_BYTES: 536870912
+      KAFKA_HEAP_OPTS: "-Xms512m -Xmx1g"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    networks:
+      - welding-net
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092"]
+      interval: 15s
+      timeout: 10s
+      retries: 15
+      start_period: 30s
+
+  kafka-init:
+    image: confluentinc/cp-kafka:7.5.3
+    container_name: welding-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command: |
+      "
+      set -e
+      echo 'Creating Kafka topics'
+
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists \
+        --topic welding.raw.v1 \
+        --partitions 8 \
+        --replication-factor 1 \
+        --config retention.ms=604800000 \
+        --config compression.type=producer \
+        --config max.message.bytes=5242880
+
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists \
+        --topic welding.validated.v1 \
+        --partitions 8 \
+        --replication-factor 1 \
+        --config retention.ms=604800000 \
+        --config compression.type=producer
+
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists \
+        --topic welding.features.v1 \
+        --partitions 8 \
+        --replication-factor 1 \
+        --config retention.ms=2592000000 \
+        --config cleanup.policy=compact,delete \
+        --config compression.type=producer
+
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists \
+        --topic welding.quality_decision.v1 \
+        --partitions 4 \
+        --replication-factor 1 \
+        --config retention.ms=2592000000
+
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists \
+        --topic welding.dlq.v1 \
+        --partitions 4 \
+        --replication-factor 1 \
+        --config retention.ms=604800000
+
+      kafka-topics --bootstrap-server kafka:9092 --list
+      echo 'Kafka topic initialization done'
+      "
+    networks:
+      - welding-net
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: welding-kafka-ui
+    restart: unless-stopped
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: welding-local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      DYNAMIC_CONFIG_ENABLED: "true"
+    networks:
+      - welding-net
+
+  producer:
+    build:
+      context: .
+      dockerfile: Dockerfile.producer
+    container_name: welding-producer
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    environment:
+      KAFKA_BOOTSTRAP: kafka:9092
+      TOPIC_RAW: welding.raw.v1
+    volumes:
+      - ${DATA_DIR:-./data}:/data:ro
+    command:
+      [
+        "--data-dir",
+        "/data",
+        "--kafka",
+        "kafka:9092",
+        "--speed",
+        "50"
+      ]
+    networks:
+      - welding-net
+
+volumes:
+  zk-data:
+  zk-log:
+  kafka-data:
+
+networks:
+  welding-net:
+    driver: bridge
