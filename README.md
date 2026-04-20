@@ -113,16 +113,24 @@ uv sync
 uv run python producer.py --data-dir ./data --kafka localhost:29092 --speed 50
 ```
 
+기본값은 생산라인 1대, 라인별 제품 10초 간격입니다.
+
 짧은 데모:
 
 ```bash
 uv run python producer.py --data-dir ./data --kafka localhost:29092 --max-products 3 --speed 100
 ```
 
+생산라인 4대 시뮬레이션:
+
+```bash
+uv run python producer.py --data-dir ./data --kafka localhost:29092 --line-count 4 --line-interval-seconds 10 --speed 50
+```
+
 중복 replay로 Kafka 부하 테스트:
 
 ```bash
-uv run python producer.py --data-dir ./data --kafka localhost:29092 --target-products 2000 --speed 200
+uv run python producer.py --data-dir ./data --kafka localhost:29092 --target-products 2000 --line-count 4 --speed 200 --no-schedule-wait
 ```
 
 Docker로 Producer 실행:
@@ -139,7 +147,10 @@ docker compose up --build producer
 | `--kafka` | `localhost:29092` | Kafka bootstrap server |
 | `--topic` | `welding.raw.v1` | 발행 topic |
 | `--chunk-size` | `5000` | 메시지 하나에 담을 sample 수 |
-| `--speed` | `50` | 재생 배속 |
+| `--speed` | `50` | 한 제품 안에서 신호 chunk를 재생하는 배속 |
+| `--line-count` | `1` | 시뮬레이션할 생산라인 수 |
+| `--line-interval-seconds` | `10` | 생산라인 1대가 다음 제품을 내보내는 간격 |
+| `--no-schedule-wait` | false | 라인 간격 대기 없이 chunk 배속만으로 빠르게 발행 |
 | `--target-products` | `0` | 중복 replay 포함 목표 제품 수 |
 | `--max-products` | 없음 | 데모용 원본 제품 수 제한 |
 | `--only-complete` | false | 16개 레이저 A/B pair가 있는 제품만 발행 |

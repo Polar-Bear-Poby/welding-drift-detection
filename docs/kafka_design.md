@@ -110,6 +110,8 @@ Consumer나 DB 저장 단계에서는 `message_id` 또는 feature key를 unique 
 
 - 같은 제품, 같은 lead, 같은 channel의 청크가 같은 파티션에 들어가므로 순서가 보장된다.
 - `line_id`를 포함해 N개 생산라인 데이터를 라인 단위로 추적할 수 있다.
+- Producer는 기본 1개 생산라인을 사용하며, `--line-count`로 라인 수를 늘릴 수 있다.
+- 각 라인은 기본 10초(`--line-interval-seconds`)마다 다음 제품을 발행하도록 스케줄링된다.
 - `timestamp`를 key로 쓰면 같은 시간대 데이터가 한 파티션에 몰릴 수 있다.
 - `random` key를 쓰면 같은 신호의 청크 순서 보장이 깨진다.
 - `product_id` 단독 key는 날짜/라인/배치가 다른 동일 제품을 구분하지 못한다.
@@ -139,12 +141,12 @@ KAFKA_LOG_RETENTION_HOURS = 168
 짧은 데모:
 
 ```bash
-python producer.py --data-dir ./data --kafka localhost:29092 --max-products 3 --speed 100
+uv run python producer.py --data-dir ./data --kafka localhost:29092 --max-products 3 --speed 100
 ```
 
 부하 테스트:
 
 ```bash
-python producer.py --data-dir ./data --kafka localhost:29092 --target-products 2000 --speed 200
+uv run python producer.py --data-dir ./data --kafka localhost:29092 --target-products 2000 --line-count 4 --speed 200 --no-schedule-wait
 ```
 

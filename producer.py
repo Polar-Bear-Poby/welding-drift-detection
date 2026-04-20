@@ -13,6 +13,13 @@ Run examples
 python producer.py --data-dir ./data --kafka localhost:29092 --speed 50
 python producer.py --data-dir ./data --target-products 2000 --speed 100
 python producer.py --data-dir ./data --dry-run
+
+강사님께 설명할 핵심 흐름
+------------------------
+1. data 폴더를 스캔해서 한 제품의 laser_b(MASKED_CH) / laser_a(MASKED_CH) CSV를 묶는다.
+2. 큰 신호 배열을 chunk 단위로 나눠 Kafka 메시지 크기를 안정적으로 유지한다.
+3. line_id + product_instance_id + lead + laser를 key로 사용해 같은 신호의 순서를 보장한다.
+4. --line-count로 생산라인을 늘려도 라인별 key가 분리되므로 Kafka가 병렬 처리할 수 있다.
 """
 
 from __future__ import annotations
@@ -47,8 +54,8 @@ MAX_REQUEST_SIZE = int(os.getenv("MAX_REQUEST_SIZE", "5242880"))
 PRODUCER_VERSION = "v1"
 
 
-# Expected file name:
-# 20220417_000442_1_WLINE_01_04_PROD_001_01_LB.csv
+# 제출용 긴 파일명과 현재 보유 데이터셋의 짧은 파일명을 모두 지원한다.
+# 긴 파일명 예: 20220417_000442_1_WLINE_01_04_PROD_001_01_LB.csv
 FILE_RE = re.compile(
     r"(?P<date>\d{8})_(?P<time>\d{6})_(?P<seq>\d+)_"
     r"(?P<line>[A-Za-z0-9]+)_(?P<batch>\d{2})_(?P<product_id>[A-Za-z0-9_-]+)_"
@@ -58,6 +65,7 @@ SIMPLE_FILE_RE = re.compile(
     r"(?P<date>\d{8})_battery_(?P<battery_id>\d+)_"
     r"(?:(?:CH(?P<channel>[01]))|(?P<laser>laser_[ab]))\.csv$"
 )
+# internal_mapping.md 기준: MASKED_CH은 laser_b/LB, MASKED_CH은 laser_a/LA이다.
 LASER_NAME_TO_CHANNEL = {"laser_b": 0, "laser_a": 1}
 LASER_ID_TO_CHANNEL = {"LB": 0, "LA": 1}
 
@@ -88,12 +96,14 @@ def channel_name(channel: int) -> str:
 class ProductRecord:
     """One physical product instance produced by one welding line."""
 
+    # ProductRecord는 스캔 단계에서 만든 "원본 제품 1개"의 메타데이터와 CSV 경로 묶음이다.
     product_instance_id: str
     product_id: str
     line_id: str
     batch_id: str
     sequence_id: str
     event_time: datetime
+    # files[channel][lead_num] = CSV path 형태로 저장해 두면 발행 단계에서 채널 순서대로 꺼낼 수 있다.
     files: dict[int, dict[int, Path]] = field(
         default_factory=lambda: {0: {}, 1: {}}
     )
@@ -116,8 +126,11 @@ class ProductRecord:
 
 @dataclass
 class PublishItem:
+    # PublishItem은 실제 Kafka로 보낼 1개 제품 이벤트이다.
+    # 같은 원본 CSV도 line_id나 product_instance_id를 바꿔 여러 생산라인 데이터처럼 replay할 수 있다.
     record: ProductRecord
     product_instance_id: str
+    line_id: str
     event_time: datetime
     is_duplicate: bool = False
     original_product_instance_id: str | None = None
@@ -141,6 +154,7 @@ def scan_data_dir(data_dir: str) -> list[ProductRecord]:
     ignored = 0
 
     for csv_path in sorted(root.glob("**/*.csv")):
+        # 1순위: 제출 문서의 정식 파일명 규칙을 파싱한다.
         match = FILE_RE.match(csv_path.name)
         if match:
             parts = match.groupdict()
@@ -157,6 +171,8 @@ def scan_data_dir(data_dir: str) -> list[ProductRecord]:
             sequence_id = parts["seq"]
             event_time = parse_event_time(parts["date"], parts["time"])
         else:
+            # 2순위: 현재 데이터셋의 짧은 파일명 규칙을 파싱한다.
+            # 예: 20220417_battery_10_laser_b.csv
             simple_match = SIMPLE_FILE_RE.match(csv_path.name)
             if not simple_match:
                 ignored += 1
@@ -171,6 +187,8 @@ def scan_data_dir(data_dir: str) -> list[ProductRecord]:
 
             lead_num = 1
             product_id = f"battery_{int(parts['battery_id'])}"
+            # 현재 샘플 데이터는 라인 정보가 파일명에 없으므로 기본 라인으로 시작한다.
+            # --line-count 옵션을 쓰면 발행 단계에서 LINE_01, LINE_02처럼 확장된다.
             line_id = "LINE_01"
             batch_id = parts["date"]
             sequence_id = parts["battery_id"]
@@ -178,6 +196,7 @@ def scan_data_dir(data_dir: str) -> list[ProductRecord]:
             event_time = parse_event_time(parts["date"], "000000")
 
         if instance_id not in records:
+            # 같은 product_instance_id 아래에 laser_b와 laser_a CSV를 계속 모은다.
             records[instance_id] = ProductRecord(
                 product_instance_id=instance_id,
                 product_id=product_id,
@@ -235,6 +254,7 @@ def make_message(
     start = chunk_index * chunk_size
     end = min(start + chunk_size, len(samples))
     chan_code = channel_code(channel)
+    # message_id는 Consumer/DB에서 중복 저장을 막기 위한 결정론적 id이다.
     message_id = (
         f"{item.product_instance_id}:L{lead_num:02d}:"
         f"{chan_code}:{chunk_index:06d}"
@@ -244,7 +264,7 @@ def make_message(
         "message_id": message_id,
         "product_instance_id": item.product_instance_id,
         "product_id": item.record.product_id,
-        "line_id": item.record.line_id,
+        "line_id": item.line_id,
         "batch_id": item.record.batch_id,
         "sequence_id": item.record.sequence_id,
         "lead_num": lead_num,
@@ -279,10 +299,13 @@ def build_producer(kafka_bootstrap: str, retries: int = 8) -> KafkaProducer:
         try:
             producer = KafkaProducer(
                 bootstrap_servers=kafka_bootstrap,
+                # acks=all은 broker가 저장 확인을 줄 때까지 성공 처리하지 않아 유실 가능성을 낮춘다.
                 acks="all",
+                # 일시적인 broker/network 문제는 Producer가 자동 재시도한다.
                 retries=10,
                 retry_backoff_ms=500,
                 request_timeout_ms=30000,
+                # 같은 연결에서 여러 요청이 앞질러 가는 것을 막아 chunk 순서 설명이 쉬워진다.
                 max_in_flight_requests_per_connection=1,
                 compression_type=os.getenv("KAFKA_COMPRESSION", "gzip"),
                 linger_ms=20,
@@ -325,48 +348,49 @@ def make_publish_items(
     records: list[ProductRecord],
     target_products: int,
     max_products: int | None,
-    duplicate_interval_seconds: int = 3,
+    line_count: int,
+    line_interval_seconds: float,
 ) -> list[PublishItem]:
-    """Create original and replay items for demo/load-test scenarios."""
+    """Create line-aware replay items for demo/load-test scenarios."""
     selected = records[:max_products] if max_products else records
-    items = [
-        PublishItem(
-            record=record,
-            product_instance_id=record.product_instance_id,
-            event_time=record.event_time,
-            is_duplicate=False,
-            original_product_instance_id=record.product_instance_id,
-            replay_iteration=0,
-        )
-        for record in selected
-    ]
-
-    if target_products <= 0 or target_products <= len(items):
-        return items
-
     if not selected:
-        return items
+        return []
 
-    needed = target_products - len(items)
-    for index in range(needed):
-        source = selected[index % len(selected)]
-        replay_no = (index // len(selected)) + 1
-        duplicate_id = f"{source.product_instance_id}_R{index + 1:05d}"
-        event_time = source.event_time + timedelta(
-            seconds=(index + 1) * duplicate_interval_seconds
+    if line_count < 1:
+        raise ValueError("line_count must be >= 1")
+
+    total_products = target_products if target_products > 0 else len(selected) * line_count
+    items: list[PublishItem] = []
+
+    for index in range(total_products):
+        # index를 라인 수로 나눠 같은 원본 제품을 여러 생산라인에서 나온 데이터처럼 분산한다.
+        line_index = index % line_count
+        product_index = index // line_count
+        source = selected[product_index % len(selected)]
+        line_id = source.line_id if line_count == 1 else f"LINE_{line_index + 1:02d}"
+        is_replay = product_index >= len(selected) or line_id != source.line_id
+        replay_no = product_index // len(selected)
+        product_instance_id = (
+            source.product_instance_id
+            if not is_replay
+            else f"{source.product_instance_id}_{line_id}_R{replay_no:05d}"
         )
+
         items.append(
             PublishItem(
                 record=source,
-                product_instance_id=duplicate_id,
-                event_time=event_time,
-                is_duplicate=True,
+                product_instance_id=product_instance_id,
+                line_id=line_id if is_replay else source.line_id,
+                # 생산라인 1대당 기본 10초 간격으로 다음 제품이 생긴다고 가정한다.
+                event_time=source.event_time
+                + timedelta(seconds=product_index * line_interval_seconds),
+                is_duplicate=is_replay,
                 original_product_instance_id=source.product_instance_id,
                 replay_iteration=replay_no,
             )
         )
 
-    return sorted(items, key=lambda item: (item.event_time, item.record.line_id, item.product_instance_id))
+    return sorted(items, key=lambda item: (item.event_time, item.line_id, item.product_instance_id))
 
 
 def publish_product(
@@ -381,6 +405,7 @@ def publish_product(
     record = item.record
 
     for lead_num in sorted(record.leads_present):
+        # 한 제품 안에서 laser_b(channel 0), laser_a(channel 1)를 순서대로 발행한다.
         for channel in (0, 1):
             file_path = record.files[channel].get(lead_num)
             if file_path is None:
@@ -400,12 +425,14 @@ def publish_product(
 
             total_chunks = max(1, int(np.ceil(len(signal) / chunk_size)))
             chan_code = channel_code(channel)
+            # partition key에 line/product/lead/laser를 넣어 같은 신호의 chunk가 같은 파티션에 쌓이게 한다.
             partition_key = (
-                f"{record.line_id}_{item.product_instance_id}_"
+                f"{item.line_id}_{item.product_instance_id}_"
                 f"L{lead_num:02d}_{chan_code}"
             )
 
             for chunk_index in range(total_chunks):
+                # 큰 CSV 전체를 한 메시지로 보내지 않고 chunk로 나눠 broker/message size 부담을 줄인다.
                 message = make_message(
                     item=item,
                     lead_num=lead_num,
@@ -422,6 +449,7 @@ def publish_product(
                 sent += 1
 
                 if speed > 0:
+                    # speed는 "제품 간격"이 아니라 한 제품 내부 신호 chunk의 재생 속도이다.
                     delay_seconds = (chunk_size / SAMPLE_RATE_HZ) / speed
                     if delay_seconds >= 0.002:
                         time.sleep(delay_seconds)
@@ -430,6 +458,7 @@ def publish_product(
 
 
 def run(args: argparse.Namespace) -> int:
+    # 실행 흐름: 스캔 -> replay 목록 생성 -> dry-run 출력 또는 Kafka 발행.
     records = scan_data_dir(args.data_dir)
     if args.only_complete:
         records = [record for record in records if record.is_complete]
@@ -443,18 +472,22 @@ def run(args: argparse.Namespace) -> int:
         records=records,
         target_products=args.target_products,
         max_products=args.max_products,
+        line_count=args.line_count,
+        line_interval_seconds=args.line_interval_seconds,
     )
 
     if args.dry_run:
         original_count = sum(1 for item in items if not item.is_duplicate)
         duplicate_count = sum(1 for item in items if item.is_duplicate)
-        lines = sorted({item.record.line_id for item in items})
+        lines = sorted({item.line_id for item in items})
         print("Dry run summary")
         print(f"- data_dir: {args.data_dir}")
         print(f"- product_instances: {len(items)}")
         print(f"- originals: {original_count}")
         print(f"- duplicates: {duplicate_count}")
         print(f"- lines: {', '.join(lines)}")
+        print(f"- line_count: {args.line_count}")
+        print(f"- line_interval_seconds: {args.line_interval_seconds}")
         print(f"- topic: {args.topic}")
         return 0
 
@@ -463,7 +496,18 @@ def run(args: argparse.Namespace) -> int:
     try:
         while True:
             total_messages = 0
+            first_event_time = items[0].event_time
+            started_at = time.monotonic()
             for index, item in enumerate(items, start=1):
+                if not args.no_schedule_wait:
+                    # event_time 차이를 wall-clock 대기로 바꿔 생산라인별 10초 간격을 시뮬레이션한다.
+                    scheduled_after = (
+                        item.event_time - first_event_time
+                    ).total_seconds()
+                    wait_seconds = scheduled_after - (time.monotonic() - started_at)
+                    if wait_seconds > 0:
+                        time.sleep(wait_seconds)
+
                 sent = publish_product(
                     producer=producer,
                     item=item,
@@ -477,12 +521,13 @@ def run(args: argparse.Namespace) -> int:
                     index,
                     len(items),
                     item.product_instance_id,
-                    item.record.line_id,
+                    item.line_id,
                     item.is_duplicate,
                     sent,
                 )
 
             producer.flush()
+            # flush 이후 종료해야 Python 프로세스가 끝나기 전에 buffered message가 모두 전송된다.
             logger.info("Run complete. total_messages=%s", total_messages)
 
             if not args.loop:
@@ -500,6 +545,7 @@ def run(args: argparse.Namespace) -> int:
 
 
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
+    # CLI 옵션은 실험 조건을 바꾸는 부분이다. 코드 수정 없이 라인 수/속도/목표 제품 수를 조절한다.
     parser = argparse.ArgumentParser(
         description="Welding CSV to Kafka producer",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -509,6 +555,23 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--topic", default=TOPIC_RAW, help="Kafka topic")
     parser.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE)
     parser.add_argument("--speed", type=float, default=50.0, help="Replay speed multiplier")
+    parser.add_argument(
+        "--line-count",
+        type=int,
+        default=1,
+        help="Number of production lines to simulate",
+    )
+    parser.add_argument(
+        "--line-interval-seconds",
+        type=float,
+        default=10.0,
+        help="Seconds between products from each production line",
+    )
+    parser.add_argument(
+        "--no-schedule-wait",
+        action="store_true",
+        help="Do not wait for the simulated line interval; publish as fast as chunk speed allows",
+    )
     parser.add_argument(
         "--target-products",
         type=int,
@@ -533,3 +596,4 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
 
 if __name__ == "__main__":
     sys.exit(run(parse_args()))
+
