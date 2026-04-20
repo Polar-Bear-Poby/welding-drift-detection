@@ -2,7 +2,11 @@
 
 배터리 레이저 용접 공정의 레이저 A, 레이저 B 데이터를 Kafka로 수집하는 과제 제출용 프로젝트입니다.
 
-이 프로젝트는 실시간 센서 API가 없는 상황을 가정합니다. 여러 생산라인의 설비 PC/NAS에 제품별 CSV 파일이 생성되면 Producer가 파일을 제품/lead/channel 단위로 그룹핑하고, 큰 신호 파일을 청크로 나누어 Kafka에 발행합니다.
+이 프로젝트는 실시간 센서 API가 없는 상황을 가정합니다. 대신 각 생산라인의 설비 PC/NAS에 제품별 CSV 파일이 10초마다 생성된다고 보고, Producer가 파일을 제품/lead/channel 단위로 그룹핑한 뒤 큰 신호 파일을 청크로 나누어 Kafka에 발행합니다.
+
+## 파이프라인 설계도
+
+![Battery Welding Drift Detection Pipeline](docs/readme.png)
 
 ## 제출물 구성
 
@@ -19,6 +23,7 @@ welding-kafka-submission/
 └── docs/
     ├── pipeline_architecture.md
     ├── kafka_design.md
+    ├── readme.png
     ├── message_schema.json
     ├── sample_message.json
     └── welding_drift_architecture_v2.svg
@@ -26,7 +31,7 @@ welding-kafka-submission/
 
 ## 핵심 시나리오
 
-N개의 생산라인에서 같은 배터리 모듈을 병렬 생산한다. 각 라인은 제품 용접이 끝날 때마다 레이저 A/B 센서 CSV를 저장한다. Producer는 파일 묶음을 감지하고 Kafka에 즉시 발행한다. 이후 Consumer는 검증, 전처리, 피처 추출, 드리프트 탐지를 수행해 다음 공정 이동 여부를 판단한다.
+N개의 생산라인에서 같은 배터리 모듈을 병렬 생산한다. 실제 센서 API는 없지만, 각 라인은 10초마다 새 제품의 레이저 A/B 센서 CSV를 저장한다고 가정한다. Producer는 이 파일 묶음을 새로 생성된 제품 데이터처럼 replay하여 Kafka에 발행한다. 이후 Consumer는 검증, 전처리, 피처 추출, 드리프트 탐지를 수행해 다음 공정 이동 여부를 판단한다.
 
 ```text
 Line 01 CSV -> Producer L01
@@ -113,7 +118,7 @@ uv sync
 uv run python producer.py --data-dir ./data --kafka localhost:29092 --speed 50
 ```
 
-기본값은 생산라인 1대, 라인별 제품 10초 간격입니다.
+기본값은 생산라인 1대이며, 실제 센서 API 대신 라인별 CSV가 10초마다 생성된다고 가정합니다.
 
 짧은 데모:
 
@@ -149,7 +154,7 @@ docker compose up --build producer
 | `--chunk-size` | `5000` | 메시지 하나에 담을 sample 수 |
 | `--speed` | `50` | 한 제품 안에서 신호 chunk를 재생하는 배속 |
 | `--line-count` | `1` | 시뮬레이션할 생산라인 수 |
-| `--line-interval-seconds` | `10` | 생산라인 1대가 다음 제품을 내보내는 간격 |
+| `--line-interval-seconds` | `10` | 생산라인 1대에서 새 CSV 묶음이 생성되는 간격 |
 | `--no-schedule-wait` | false | 라인 간격 대기 없이 chunk 배속만으로 빠르게 발행 |
 | `--target-products` | `0` | 중복 replay 포함 목표 제품 수 |
 | `--max-products` | 없음 | 데모용 원본 제품 수 제한 |

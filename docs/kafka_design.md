@@ -2,6 +2,8 @@
 
 ## 1. Producer 코드 흐름
 
+실제 센서 API는 없다고 가정한다. 대신 각 생산라인의 설비 PC/NAS에 제품별 CSV 묶음이 10초마다 생성되고, Producer는 이 파일 생성 이벤트를 Kafka 메시지로 replay한다.
+
 ```mermaid
 flowchart TD
     A["CSV 파일 스캔"] --> B["파일명 파싱"]
@@ -111,7 +113,7 @@ Consumer나 DB 저장 단계에서는 `message_id` 또는 feature key를 unique 
 - 같은 제품, 같은 lead, 같은 channel의 청크가 같은 파티션에 들어가므로 순서가 보장된다.
 - `line_id`를 포함해 N개 생산라인 데이터를 라인 단위로 추적할 수 있다.
 - Producer는 기본 1개 생산라인을 사용하며, `--line-count`로 라인 수를 늘릴 수 있다.
-- 각 라인은 기본 10초(`--line-interval-seconds`)마다 다음 제품을 발행하도록 스케줄링된다.
+- 각 라인은 기본 10초(`--line-interval-seconds`)마다 새 CSV 묶음이 생성된 것으로 스케줄링된다.
 - `timestamp`를 key로 쓰면 같은 시간대 데이터가 한 파티션에 몰릴 수 있다.
 - `random` key를 쓰면 같은 신호의 청크 순서 보장이 깨진다.
 - `product_id` 단독 key는 날짜/라인/배치가 다른 동일 제품을 구분하지 못한다.
