@@ -20,7 +20,8 @@ flowchart TD
 
 ```text
 {date}_battery_{battery_id}_laser_{a|b}.csv
-예: 20220417_000442_1_WLINE_01_04_PROD_001_01_LA.csv
+{date}_{time}_{seq}_{line}_{batch}_{product_id}_{lead_num}_{laser_id}.csv
+예: 20220417_000442_1_WLINE_01_04_PROD_001_01_LB.csv
 ```
 
 Producer는 `date + time + seq + line + batch + product_id`로 `product_instance_id`를 만든다.

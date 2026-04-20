@@ -51,7 +51,7 @@
     "channel": {
       "type": "integer",
       "enum": [0, 1],
-      "description": "0=LaserA, 1=LaserB"
+      "description": "0=LaserB/LB, 1=LaserA/LA"
     },
     "channel_name": {
       "type": "string",

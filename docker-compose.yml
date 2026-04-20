@@ -12,7 +12,7 @@ services:
     networks:
       - welding-net
     healthcheck:
-      test: ["CMD-SHELL", "echo ruok | nc localhost 2181 | grep imok"]
+      test: ["CMD-SHELL", "echo srvr | nc localhost 2181 | grep 'Zookeeper version'"]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -58,50 +58,17 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
-    entrypoint: ["/bin/bash", "-c"]
-    command: |
-      "
-      set -e
-      echo 'Creating Kafka topics'
-
-      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists \
-        --topic welding.raw.v1 \
-        --partitions 8 \
-        --replication-factor 1 \
-        --config retention.ms=604800000 \
-        --config compression.type=producer \
-        --config max.message.bytes=5242880
-
-      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists \
-        --topic welding.validated.v1 \
-        --partitions 8 \
-        --replication-factor 1 \
-        --config retention.ms=604800000 \
-        --config compression.type=producer
-
-      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists \
-        --topic welding.features.v1 \
-        --partitions 8 \
-        --replication-factor 1 \
-        --config retention.ms=2592000000 \
-        --config cleanup.policy=compact,delete \
-        --config compression.type=producer
-
-      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists \
-        --topic welding.quality_decision.v1 \
-        --partitions 4 \
-        --replication-factor 1 \
-        --config retention.ms=2592000000
-
-      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists \
-        --topic welding.dlq.v1 \
-        --partitions 4 \
-        --replication-factor 1 \
-        --config retention.ms=604800000
-
-      kafka-topics --bootstrap-server kafka:9092 --list
-      echo 'Kafka topic initialization done'
-      "
+    entrypoint: ["/bin/bash", "-ec"]
+    command:
+      - |
+        echo 'Creating Kafka topics'
+        kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic welding.raw.v1 --partitions 8 --replication-factor 1 --config retention.ms=604800000 --config compression.type=producer --config max.message.bytes=5242880
+        kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic welding.validated.v1 --partitions 8 --replication-factor 1 --config retention.ms=604800000 --config compression.type=producer
+        kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic welding.features.v1 --partitions 8 --replication-factor 1 --config retention.ms=2592000000 --config cleanup.policy=compact,delete --config compression.type=producer
+        kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic welding.quality_decision.v1 --partitions 4 --replication-factor 1 --config retention.ms=2592000000
+        kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic welding.dlq.v1 --partitions 4 --replication-factor 1 --config retention.ms=604800000
+        kafka-topics --bootstrap-server kafka:9092 --list
+        echo 'Kafka topic initialization done'
     networks:
       - welding-net
 

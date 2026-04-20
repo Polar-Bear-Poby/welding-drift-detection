@@ -11,6 +11,8 @@ welding-kafka-submission/
 ├── producer.py
 ├── docker-compose.yml
 ├── Dockerfile.producer
+├── pyproject.toml
+├── uv.lock
 ├── requirements.txt
 ├── .env.example
 ├── README.md
@@ -36,6 +38,8 @@ Line N  CSV -> Producer LN
 ```
 
 ## 실행 방법
+
+Python 패키지는 `uv`로 관리합니다. 로컬 실행 전 `uv sync`로 `.venv`를 구성하세요.
 
 ### 1. 환경 파일 생성
 
@@ -73,23 +77,31 @@ http://localhost:8080
 
 ```text
 data/
-├── 20220417_000442_1_WLINE_01_04_PROD_001_01_LA.csv
-├── 20220417_000442_1_WLINE_01_04_PROD_001_01_LB.csv
+├── laser_a/
+│   └── 20220417/
+│       └── 20220417_battery_10_laser_a.csv
+├── laser_b/
+│   └── 20220417/
+│       └── 20220417_battery_10_laser_b.csv
 └── ...
 ```
 
-파일명 규칙:
+지원하는 파일명 규칙:
 
 ```text
 {date}_battery_{battery_id}_laser_{a|b}.csv
+{date}_battery_{battery_id}_CH{channel}.csv
+{date}_battery_{battery_id}_laser_{a|b}.csv
 ```
+
+채널 매핑은 `internal_mapping.md` 기준을 따릅니다. `laser_a`/`MASKED_CH`은 `LA` 및 channel 1, `laser_b`/`MASKED_CH`은 `LB` 및 channel 0으로 처리됩니다.
 
 ### 4. Producer dry run
 
 Kafka에 보내기 전에 파일이 정상적으로 인식되는지 확인합니다.
 
 ```bash
-python producer.py --data-dir ./data --dry-run
+uv run python producer.py --data-dir ./data --dry-run
 ```
 
 ### 5. Producer 실행
@@ -97,20 +109,20 @@ python producer.py --data-dir ./data --dry-run
 로컬 Python 실행:
 
 ```bash
-pip install -r requirements.txt
-python producer.py --data-dir ./data --kafka localhost:29092 --speed 50
+uv sync
+uv run python producer.py --data-dir ./data --kafka localhost:29092 --speed 50
 ```
 
 짧은 데모:
 
 ```bash
-python producer.py --data-dir ./data --kafka localhost:29092 --max-products 3 --speed 100
+uv run python producer.py --data-dir ./data --kafka localhost:29092 --max-products 3 --speed 100
 ```
 
 중복 replay로 Kafka 부하 테스트:
 
 ```bash
-python producer.py --data-dir ./data --kafka localhost:29092 --target-products 2000 --speed 200
+uv run python producer.py --data-dir ./data --kafka localhost:29092 --target-products 2000 --speed 200
 ```
 
 Docker로 Producer 실행:
@@ -158,7 +170,7 @@ docker compose up --build producer
 
 ```json
 {
-  "message_id": "20220417_000442_1_WLINE_01_04_PROD_001:L01:LA:000000",
+  "message_id": "20220417_000442_1_WLINE_01_04_PROD_001:L01:LB:000000",
   "product_instance_id": "20220417_000442_1_WLINE_01_04_PROD_001",
   "product_id": "PROD_001",
   "line_id": "WLINE_01",

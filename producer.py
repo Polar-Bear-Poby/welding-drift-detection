@@ -48,12 +48,18 @@ PRODUCER_VERSION = "v1"
 
 
 # Expected file name:
-# 20220417_000442_1_WLINE_01_04_PROD_001_01_LA.csv
+# 20220417_000442_1_WLINE_01_04_PROD_001_01_LB.csv
 FILE_RE = re.compile(
     r"(?P<date>\d{8})_(?P<time>\d{6})_(?P<seq>\d+)_"
     r"(?P<line>[A-Za-z0-9]+)_(?P<batch>\d{2})_(?P<product_id>[A-Za-z0-9_-]+)_"
-    r"(?P<lead_num>\d{2})_CH(?P<channel>[01])\.csv$"
+    r"(?P<lead_num>\d{2})_(?:(?:CH(?P<channel>[01]))|(?P<laser_id>L[AB]))\.csv$"
 )
+SIMPLE_FILE_RE = re.compile(
+    r"(?P<date>\d{8})_battery_(?P<battery_id>\d+)_"
+    r"(?:(?:CH(?P<channel>[01]))|(?P<laser>laser_[ab]))\.csv$"
+)
+LASER_NAME_TO_CHANNEL = {"laser_b": 0, "laser_a": 1}
+LASER_ID_TO_CHANNEL = {"LB": 0, "LA": 1}
 
 
 def parse_event_time(date_text: str, time_text: str) -> datetime:
@@ -70,8 +76,12 @@ def lead_type_from_num(lead_num: int) -> str:
     return "AL_CU" if lead_num % 2 == 1 else "CU_CU"
 
 
+def channel_code(channel: int) -> str:
+    return "LB" if channel == 0 else "LA"
+
+
 def channel_name(channel: int) -> str:
-    return "LaserA" if channel == 0 else "LaserB"
+    return "LaserB" if channel == 0 else "LaserA"
 
 
 @dataclass
@@ -132,23 +142,49 @@ def scan_data_dir(data_dir: str) -> list[ProductRecord]:
 
     for csv_path in sorted(root.glob("**/*.csv")):
         match = FILE_RE.match(csv_path.name)
-        if not match:
-            ignored += 1
-            continue
+        if match:
+            parts = match.groupdict()
+            instance_id = build_instance_id(parts)
+            lead_num = int(parts["lead_num"])
+            channel = (
+                LASER_ID_TO_CHANNEL[parts["laser_id"]]
+                if parts.get("laser_id")
+                else int(parts["channel"])
+            )
+            product_id = parts["product_id"]
+            line_id = parts["line"]
+            batch_id = parts["batch"]
+            sequence_id = parts["seq"]
+            event_time = parse_event_time(parts["date"], parts["time"])
+        else:
+            simple_match = SIMPLE_FILE_RE.match(csv_path.name)
+            if not simple_match:
+                ignored += 1
+                continue
 
-        parts = match.groupdict()
-        instance_id = build_instance_id(parts)
-        lead_num = int(parts["lead_num"])
-        channel = int(parts["channel"])
+            parts = simple_match.groupdict()
+            channel = (
+                LASER_NAME_TO_CHANNEL[parts["laser"].lower()]
+                if parts.get("laser")
+                else int(parts["channel"])
+            )
+
+            lead_num = 1
+            product_id = f"battery_{int(parts['battery_id'])}"
+            line_id = "LINE_01"
+            batch_id = parts["date"]
+            sequence_id = parts["battery_id"]
+            instance_id = f"{parts['date']}_{product_id}"
+            event_time = parse_event_time(parts["date"], "000000")
 
         if instance_id not in records:
             records[instance_id] = ProductRecord(
                 product_instance_id=instance_id,
-                product_id=parts["product_id"],
-                line_id=parts["line"],
-                batch_id=parts["batch"],
-                sequence_id=parts["seq"],
-                event_time=parse_event_time(parts["date"], parts["time"]),
+                product_id=product_id,
+                line_id=line_id,
+                batch_id=batch_id,
+                sequence_id=sequence_id,
+                event_time=event_time,
             )
 
         records[instance_id].add_file(lead_num, channel, csv_path)
@@ -198,7 +234,7 @@ def make_message(
 ) -> dict:
     start = chunk_index * chunk_size
     end = min(start + chunk_size, len(samples))
-    chan_code = "LA" if channel == 0 else "LB"
+    chan_code = channel_code(channel)
     message_id = (
         f"{item.product_instance_id}:L{lead_num:02d}:"
         f"{chan_code}:{chunk_index:06d}"
@@ -247,7 +283,6 @@ def build_producer(kafka_bootstrap: str, retries: int = 8) -> KafkaProducer:
                 retries=10,
                 retry_backoff_ms=500,
                 request_timeout_ms=30000,
-                delivery_timeout_ms=120000,
                 max_in_flight_requests_per_connection=1,
                 compression_type=os.getenv("KAFKA_COMPRESSION", "gzip"),
                 linger_ms=20,
@@ -364,7 +399,7 @@ def publish_product(
                 continue
 
             total_chunks = max(1, int(np.ceil(len(signal) / chunk_size)))
-            chan_code = "LA" if channel == 0 else "LB"
+            chan_code = channel_code(channel)
             partition_key = (
                 f"{record.line_id}_{item.product_instance_id}_"
                 f"L{lead_num:02d}_{chan_code}"
