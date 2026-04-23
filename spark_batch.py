@@ -10,6 +10,7 @@ PostgreSQL).
 from __future__ import annotations
 
 import argparse
+import logging
 import math
 import os
 import re
@@ -39,6 +40,25 @@ LINE_PREFIX_RE = re.compile(r"^(?P<line>\d+)_")
 BATTERY_RE = re.compile(r"battery_(?P<battery_id>\d+)", re.IGNORECASE)
 DATE_RE = re.compile(r"(?P<date>20\d{6})")
 TRAILING_SUFFIX_RE = re.compile(r"_(?:CH[01]|laser_[ab]|L[AB])$", re.IGNORECASE)
+
+
+LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+logging.basicConfig(level=logging.INFO, format=LOG_FORMAT, datefmt="%H:%M:%S")
+logger = logging.getLogger("welding.spark_batch")
+
+
+def setup_file_logger(output_dir: str) -> None:
+    log_dir = Path(output_dir).parent / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / "spark_batch.log"
+    
+    if any(isinstance(h, logging.FileHandler) for h in logger.handlers):
+        return
+
+    file_handler = logging.FileHandler(log_file, encoding="utf-8")
+    file_handler.setFormatter(logging.Formatter(LOG_FORMAT, datefmt="%H:%M:%S"))
+    logger.addHandler(file_handler)
+    logger.info("File logging enabled: %s", log_file)
 
 
 def load_env_file(path: str = ".env") -> None:
@@ -659,10 +679,13 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
 
 
 def run(args: argparse.Namespace) -> int:
+    setup_file_logger(args.output_dir)
+    logger.info("Starting spark batch preprocessing...")
+
     started_at = datetime.now(timezone.utc)
     files = discover_csv_files(args.input_dir, args.max_files)
     if not files:
-        print(f"No CSV files found in {args.input_dir}")
+        logger.warning("No CSV files found in %s", args.input_dir)
         return 2
 
     # --oldest-date-only: parse metadata quickly and filter to oldest date
@@ -677,7 +700,7 @@ def run(args: argparse.Namespace) -> int:
         if parsed_files:
             oldest = min(parsed_files, key=lambda x: x[1])[1]
             files = [p for p, d in parsed_files if d == oldest]
-            print(f"Filtered to oldest date {oldest}: {len(files)} files")
+            logger.info("Filtered to oldest date %s: %s files", oldest, len(files))
 
     rows: list[dict] = []
     skipped = 0
@@ -693,10 +716,10 @@ def run(args: argparse.Namespace) -> int:
             )
         except Exception as exc:
             skipped += 1
-            print(f"skip {path}: {exc}")
+            logger.warning("skip %s: %s", path, exc)
 
     if not rows:
-        print("No valid signals were parsed from input CSV files.")
+        logger.error("No valid signals were parsed from input CSV files.")
         return 3
 
     spark = create_spark(master=args.master, shuffle_partitions=args.shuffle_partitions)
@@ -708,14 +731,15 @@ def run(args: argparse.Namespace) -> int:
         summary_rows = summary_df.count()
         segments_path, summary_path = write_parquet(segments_df, summary_df, args.output_dir)
 
-        print(f"run_id={args.run_id}")
-        print(f"input_files={len(files)} skipped_files={skipped}")
-        print(f"segment_rows={segment_rows} summary_rows={summary_rows}")
-        print(f"segments_parquet={segments_path}")
-        print(f"summary_parquet={summary_path}")
+        logger.info("run_id=%s", args.run_id)
+        logger.info("input_files=%s skipped_files=%s", len(files), skipped)
+        logger.info("segment_rows=%s summary_rows=%s", segment_rows, summary_rows)
+        logger.info("segments_parquet=%s", segments_path)
+        logger.info("summary_parquet=%s", summary_path)
+
+        finished_at = datetime.now(timezone.utc)
 
         if args.write_postgres:
-            finished_at = datetime.now(timezone.utc)
             seg_written, sum_written = write_postgres(
                 summary_df=summary_df,
                 segments_df=segments_df,
@@ -730,8 +754,22 @@ def run(args: argparse.Namespace) -> int:
                 user=args.postgres_user,
                 password=args.postgres_password,
             )
-            print(f"postgres_written_segments={seg_written}")
-            print(f"postgres_written_summary={sum_written}")
+            logger.info("postgres_written_segments=%s", seg_written)
+            logger.info("postgres_written_summary=%s", sum_written)
+            finished_at = datetime.now(timezone.utc)
+
+        duration_sec = (finished_at - started_at).total_seconds()
+        files_per_sec = len(files) / duration_sec if duration_sec > 0 else 0.0
+        segment_rows_per_sec = segment_rows / duration_sec if duration_sec > 0 else 0.0
+        summary_rows_per_sec = summary_rows / duration_sec if duration_sec > 0 else 0.0
+
+        logger.info(
+            "Batch complete. duration_sec=%.2f files_per_sec=%.2f segment_rows_per_sec=%.2f summary_rows_per_sec=%.2f",
+            duration_sec, files_per_sec, segment_rows_per_sec, summary_rows_per_sec
+        )
+    except Exception as e:
+        logger.error("Error during batch processing: %s", e)
+        raise
     finally:
         spark.stop()
 

@@ -69,6 +69,23 @@ logging.basicConfig(level=logging.INFO, format=LOG_FORMAT, datefmt="%H:%M:%S")
 logger = logging.getLogger("welding.producer")
 
 
+def setup_file_logger(storage_dir: str | None) -> None:
+    if not storage_dir:
+        storage_dir = str(Path.cwd() / "storage")
+    log_dir = Path(storage_dir) / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / "producer.log"
+    
+    # 중복 추가 방지
+    if any(isinstance(h, logging.FileHandler) for h in logger.handlers):
+        return
+
+    file_handler = logging.FileHandler(log_file, encoding="utf-8")
+    file_handler.setFormatter(logging.Formatter(LOG_FORMAT, datefmt="%H:%M:%S"))
+    logger.addHandler(file_handler)
+    logger.info("File logging enabled: %s", log_file)
+
+
 DEFAULT_DATA_DIR = os.getenv("DATA_DIR") or None
 DEFAULT_STORAGE_DIR = os.getenv("STORAGE_DIR") or None
 TOPIC_RAW = os.getenv("TOPIC_RAW", "welding.raw.v1")
@@ -565,6 +582,9 @@ def publish_product(
 
 
 def run(args: argparse.Namespace) -> int:
+    # Set up file logger before proceeding
+    setup_file_logger(args.storage_dir)
+
     # 실행 흐름: 스캔 -> replay 목록 생성 -> dry-run 출력 또는 Kafka 발행.
     records = scan_data_dir(args.data_dir)
     if args.only_complete:
@@ -635,6 +655,7 @@ def run(args: argparse.Namespace) -> int:
                     if wait_seconds > 0:
                         time.sleep(wait_seconds)
 
+                pub_start = time.monotonic()
                 sent = publish_product(
                     producer=producer,
                     item=item,
@@ -642,20 +663,31 @@ def run(args: argparse.Namespace) -> int:
                     chunk_size=args.chunk_size,
                     speed=args.speed,
                 )
+                pub_elapsed = time.monotonic() - pub_start
                 total_messages += sent
+                msg_per_sec = sent / pub_elapsed if pub_elapsed > 0 else 0.0
+
                 logger.info(
-                    "[%s/%s] product=%s line=%s duplicate=%s messages=%s",
+                    "[%s/%s] product=%s line=%s duplicate=%s messages=%s elapsed_ms=%.2f msg_per_sec=%.2f",
                     index,
                     len(items),
                     item.product_instance_id,
                     item.line_id,
                     item.is_duplicate,
                     sent,
+                    pub_elapsed * 1000,
+                    msg_per_sec,
                 )
 
             producer.flush()
+            total_elapsed = time.monotonic() - started_at
+            avg_msg_per_sec = total_messages / total_elapsed if total_elapsed > 0 else 0.0
+            
             # flush 이후 종료해야 Python 프로세스가 끝나기 전에 buffered message가 모두 전송된다.
-            logger.info("Run complete. total_messages=%s", total_messages)
+            logger.info(
+                "Run complete. total_messages=%s total_elapsed_sec=%.2f avg_msg_per_sec=%.2f", 
+                total_messages, total_elapsed, avg_msg_per_sec
+            )
 
             if not args.loop:
                 break

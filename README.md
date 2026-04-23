@@ -6,7 +6,7 @@
 
 ## 파이프라인 설계도
 
-![Battery Welding Drift Detection Pipeline](docs/readme.png)
+![Battery Welding Drift Detection Pipeline](docs/readme_ver2.png)
 
 ## 제출물 구성
 
@@ -227,6 +227,15 @@ docker exec welding-spark-master /opt/spark/bin/spark-submit \
   --postgres-host postgres \
   --postgres-port 5432
 ```
+
+## PostgreSQL 스키마 구조 (welding 스키마)
+
+Spark Batch 처리를 통해 산출된 메타데이터와 성능 및 품질 판정 결과는 PostgreSQL 데이터베이스의 `welding` 스키마 내 테이블에 저장됩니다.
+
+- `pipeline_heartbeat`: 파이프라인 구성 요소들의 상태와 마지막 동작 시간 기록
+- `spark_batch_run`: Spark 배치 작업 메타데이터 (시작/종료 시간, 처리한 파일 수, 저장 경로 등)
+- `pattern_segment`: 센서 신호 16개 세그먼트별 통계치 (평균, 표준편차, 최소/최대값, 샘플 수)
+- `pattern_summary`: 센서 1개 파일 단위 요약 데이터 (홀짝 세그먼트 평균 편차, cpd_score, 품질 판정 결과)
 
 ## 포트 계획
 
