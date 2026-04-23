@@ -6,8 +6,11 @@ venv/
 data/
 models/
 logs/
+storage/
+spark-checkpoints/
+out/
 *.zip
 .DS_Store
 
-# Sensitive Data Mapping
+# local-only
 docs/internal_mapping.md

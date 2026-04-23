@@ -13,8 +13,18 @@
 ```text
 welding-kafka-submission/
 ├── producer.py
+├── spark_batch.py
 ├── docker-compose.yml
 ├── Dockerfile.producer
+├── Dockerfile.spark
+├── schema.sql
+├── airflow/
+│   ├── dags/
+│   ├── logs/
+│   └── plugins/
+├── db/
+│   └── init/
+│       └── 001_bootstrap.sql
 ├── pyproject.toml
 ├── uv.lock
 ├── requirements.txt
@@ -58,16 +68,42 @@ Windows PowerShell에서는 아래처럼 실행해도 됩니다.
 Copy-Item .env.example .env
 ```
 
+`.env`에는 로컬 전용 경로를 직접 입력합니다. `.env`는 `.gitignore`에 포함되어 있으므로 GitHub에 업로드하지 않습니다.
+
+```text
+DATA_DIR=<PRIVATE_RAW_DATA_ROOT>
+STORAGE_DIR=<PRIVATE_OUTPUT_STORAGE_ROOT>
+```
+
 EC2에서 실행할 경우 `.env`의 `KAFKA_EXTERNAL_HOST`를 EC2 public IP로 변경합니다.
 
 ```text
 KAFKA_EXTERNAL_HOST=<EC2_PUBLIC_IP>
 ```
 
-### 2. Kafka 실행
+### 2. 플랫폼 컨테이너 실행 (Kafka + Spark + PostgreSQL)
 
 ```bash
-docker compose up -d zookeeper kafka kafka-init kafka-ui
+docker compose up -d --build zookeeper kafka kafka-init kafka-ui postgres spark-master spark-worker
+```
+
+### 2-1. Airflow 실행 (선택, profile 기반)
+
+```bash
+docker compose --profile airflow up -d airflow-init airflow-webserver airflow-scheduler
+```
+
+Airflow UI:
+
+```text
+http://localhost:18088
+```
+
+기본 계정(로컬 데모용):
+
+```text
+username: admin
+password: admin
 ```
 
 Kafka UI:
@@ -76,18 +112,37 @@ Kafka UI:
 http://localhost:8080
 ```
 
-### 3. 데이터 준비
-
-`data/` 폴더에 CSV 파일을 넣습니다.
+Spark Master UI:
 
 ```text
-data/
-├── laser_a/
-│   └── 20220417/
-│       └── 20220417_battery_10_laser_a.csv
-├── laser_b/
-│   └── 20220417/
-│       └── 20220417_battery_10_laser_b.csv
+http://localhost:18080
+```
+
+PostgreSQL (host access):
+
+```text
+localhost:15432
+```
+
+내부 컨테이너 통신 주소:
+
+```text
+Kafka:     kafka:9092
+Spark:     spark://spark-master:7077
+Postgres:  postgres:5432
+```
+
+### 3. 데이터 준비
+
+원본 CSV 위치는 `.env`의 `DATA_DIR`로만 관리합니다. 저장/아카이브 경로는 `.env`의 `STORAGE_DIR`로만 관리합니다.
+
+```text
+<DATA_DIR>/
+├── 20220417/
+│   ├── out/
+│   │   └── battery_10.csv
+│   └── reflect/
+│       └── battery_10.csv
 └── ...
 ```
 
@@ -100,13 +155,14 @@ data/
 ```
 
 채널 매핑은 `internal_mapping.md` 기준을 따릅니다. `laser_a`/`MASKED_CH`은 `LA` 및 channel 1, `laser_b`/`MASKED_CH`은 `LB` 및 channel 0으로 처리됩니다.
+새 저장소 구조에서는 `out`이 `MASKED_CH/LA/laser_a`, `reflect`가 `MASKED_CH/LB/laser_b`로 처리됩니다.
 
 ### 4. Producer dry run
 
 Kafka에 보내기 전에 파일이 정상적으로 인식되는지 확인합니다.
 
 ```bash
-uv run python producer.py --data-dir ./data --dry-run
+uv run python producer.py --dry-run
 ```
 
 ### 5. Producer 실행
@@ -115,7 +171,7 @@ uv run python producer.py --data-dir ./data --dry-run
 
 ```bash
 uv sync
-uv run python producer.py --data-dir ./data --kafka localhost:29092 --speed 50
+uv run python producer.py --kafka localhost:29092 --speed 50
 ```
 
 기본값은 생산라인 1대이며, 실제 센서 API 대신 라인별 CSV가 10초마다 생성된다고 가정합니다.
@@ -123,19 +179,19 @@ uv run python producer.py --data-dir ./data --kafka localhost:29092 --speed 50
 짧은 데모:
 
 ```bash
-uv run python producer.py --data-dir ./data --kafka localhost:29092 --max-products 3 --speed 100
+uv run python producer.py --kafka localhost:29092 --max-products 3 --speed 100
 ```
 
 생산라인 4대 시뮬레이션:
 
 ```bash
-uv run python producer.py --data-dir ./data --kafka localhost:29092 --line-count 4 --line-interval-seconds 10 --speed 50
+uv run python producer.py --kafka localhost:29092 --line-count 4 --line-interval-seconds 10 --speed 50
 ```
 
 중복 replay로 Kafka 부하 테스트:
 
 ```bash
-uv run python producer.py --data-dir ./data --kafka localhost:29092 --target-products 2000 --line-count 4 --speed 200 --no-schedule-wait
+uv run python producer.py --kafka localhost:29092 --target-products 2000 --line-count 4 --speed 200 --no-schedule-wait
 ```
 
 Docker로 Producer 실행:
@@ -144,11 +200,76 @@ Docker로 Producer 실행:
 docker compose up --build producer
 ```
 
+### 6. Spark batch 전처리 실행 (여러 CSV 일괄 처리)
+
+로컬 Python 실행:
+
+```bash
+uv sync
+uv run python spark_batch.py --input-dir <DATA_DIR> --output-dir <STORAGE_DIR>/spark_batch
+```
+
+PostgreSQL 저장까지 포함:
+
+```bash
+uv run python spark_batch.py --input-dir <DATA_DIR> --output-dir <STORAGE_DIR>/spark_batch --write-postgres
+```
+
+Spark 컨테이너에서 실행(클러스터 모드 데모):
+
+```bash
+docker exec welding-spark-master /opt/spark/bin/spark-submit \
+  --master spark://spark-master:7077 \
+  /opt/spark/apps/spark_batch.py \
+  --input-dir /data \
+  --output-dir /storage/spark_batch \
+  --write-postgres \
+  --postgres-host postgres \
+  --postgres-port 5432
+```
+
+## 포트 계획
+
+| 컴포넌트 | 컨테이너 포트 | 호스트 포트 기본값 | 비고 |
+|---|---:|---:|---|
+| Kafka external | 29092 | 29092 | Producer 로컬 실행 진입점 |
+| Kafka UI | 8080 | 8080 | Topic/메시지 확인 |
+| Spark Master RPC | 7077 | 7077 | Spark submit 연결 |
+| Spark Master UI | 8080 | 18080 | Spark 클러스터 모니터링 |
+| Spark Worker UI | 8081 | 18081 | Worker 모니터링 |
+| PostgreSQL | 5432 | 15432 | 로컬 SQL 접속 |
+| Airflow Web | 8080 | 18088 | DAG 스케줄링/모니터링 |
+| Airflow Flower (reserved) | 5555 | 15555 | 향후 태스크 모니터링 |
+
+## 테스트
+
+Kafka 없이 빠르게 검증:
+
+```bash
+uv run python -m unittest discover -s tests -v
+```
+
+실제 Kafka broker까지 검증:
+
+```powershell
+$env:RUN_KAFKA_INTEGRATION='1'
+uv run python -m unittest discover -s tests -p test_kafka_integration.py -v
+```
+
+통과 기준:
+
+- `laser_b`는 `MASKED_CH/LB/LaserB`, `laser_a`는 `MASKED_CH/LA/LaserA`로 매핑된다.
+- 같은 제품의 `laser_b`, `laser_a` CSV가 하나의 product instance로 묶인다.
+- 생산라인을 늘리면 `LINE_01`, `LINE_02`처럼 라인별 이벤트가 생성되고, 같은 라인은 10초 간격을 유지한다.
+- CSV 신호는 chunk로 나뉘며, partition key에는 `line_id + product_instance_id + lead + laser`가 들어간다.
+- 실제 Kafka 통합 테스트에서는 broker가 Producer 메시지를 ack하고 topic/partition/offset metadata를 반환해야 한다.
+
 ## Producer CLI 옵션
 
 | 옵션 | 기본값 | 설명 |
 |---|---:|---|
-| `--data-dir` | 필수 | CSV 파일 루트 디렉토리 |
+| `--data-dir` | `.env`의 `DATA_DIR` | CSV 파일 루트 디렉토리 |
+| `--storage-dir` | `.env`의 `STORAGE_DIR` | Spark/Parquet/checkpoint/model 출력 루트 디렉토리 |
 | `--kafka` | `localhost:29092` | Kafka bootstrap server |
 | `--topic` | `welding.raw.v1` | 발행 topic |
 | `--chunk-size` | `5000` | 메시지 하나에 담을 sample 수 |
@@ -227,6 +348,8 @@ git push -u origin main
 ## 제출 체크리스트
 
 - [x] `producer.py`
+- [x] `spark_batch.py`
+- [x] `schema.sql`
 - [x] `docker-compose.yml`
 - [x] Kafka 실행 환경
 - [x] 파이프라인 구성도 문서

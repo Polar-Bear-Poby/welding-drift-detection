@@ -106,7 +106,8 @@
           "type": "string"
         },
         "file_name": {
-          "type": "string"
+          "type": "string",
+          "description": "Original CSV name prefixed with line number. e.g. 3_20220417_battery_10_laser_b.csv"
         },
         "original_product_instance_id": {
           "type": "string"

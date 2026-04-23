@@ -1,3 +1,31 @@
+x-airflow-common: &airflow-common
+  image: apache/airflow:2.9.3
+  profiles: ["airflow"]
+  user: "${AIRFLOW_UID:-50000}:0"
+  environment:
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-welding}:${POSTGRES_PASSWORD:-welding_pass}@postgres:5432/${POSTGRES_DB:-welding_drift}
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:-}
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+    AIRFLOW_CONN_KAFKA_DEFAULT: kafka://kafka:9092
+    AIRFLOW_CONN_SPARK_DEFAULT: spark://spark-master:7077
+    AIRFLOW_CONN_WELDING_POSTGRES: postgresql://${POSTGRES_USER:-welding}:${POSTGRES_PASSWORD:-welding_pass}@postgres:5432/${POSTGRES_DB:-welding_drift}
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags
+    - ./airflow/logs:/opt/airflow/logs
+    - ./airflow/plugins:/opt/airflow/plugins
+  networks:
+    - welding-net
+  depends_on:
+    postgres:
+      condition: service_healthy
+    kafka-init:
+      condition: service_completed_successfully
+    spark-master:
+      condition: service_started
+
 services:
   zookeeper:
     image: confluentinc/cp-zookeeper:7.5.3
@@ -25,7 +53,7 @@ services:
       zookeeper:
         condition: service_healthy
     ports:
-      - "29092:29092"
+      - "${KAFKA_EXTERNAL_PORT:-29092}:29092"
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
@@ -80,13 +108,158 @@ services:
       kafka:
         condition: service_healthy
     ports:
-      - "8080:8080"
+      - "${KAFKA_UI_PORT:-8080}:8080"
     environment:
       KAFKA_CLUSTERS_0_NAME: welding-local
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
       DYNAMIC_CONFIG_ENABLED: "true"
     networks:
       - welding-net
+
+  postgres:
+    image: postgres:16
+    container_name: welding-postgres
+    restart: unless-stopped
+    ports:
+      - "${POSTGRES_PORT:-15432}:5432"
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-welding_drift}
+      POSTGRES_USER: ${POSTGRES_USER:-welding}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-welding_pass}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    networks:
+      - welding-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-welding} -d ${POSTGRES_DB:-welding_drift}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  spark-master:
+    build:
+      context: .
+      dockerfile: Dockerfile.spark
+    image: welding-spark:3.5.1
+    container_name: welding-spark-master
+    restart: unless-stopped
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    ports:
+      - "${SPARK_MASTER_PORT:-7077}:7077"
+      - "${SPARK_MASTER_UI_PORT:-18080}:8080"
+    command:
+      [
+        "/opt/spark/bin/spark-class",
+        "org.apache.spark.deploy.master.Master",
+        "--host",
+        "spark-master",
+        "--port",
+        "7077",
+        "--webui-port",
+        "8080"
+      ]
+    volumes:
+      - spark-events:/opt/spark/events
+      - ${DATA_DIR:?set DATA_DIR in .env}:/data:ro
+      - ${STORAGE_DIR:?set STORAGE_DIR in .env}:/storage
+      - ./spark_batch.py:/opt/spark/apps/spark_batch.py:ro
+    networks:
+      - welding-net
+
+  spark-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.spark
+    image: welding-spark:3.5.1
+    container_name: welding-spark-worker
+    restart: unless-stopped
+    depends_on:
+      spark-master:
+        condition: service_started
+    ports:
+      - "${SPARK_WORKER_UI_PORT:-18081}:8081"
+    command:
+      [
+        "/opt/spark/bin/spark-class",
+        "org.apache.spark.deploy.worker.Worker",
+        "spark://spark-master:7077",
+        "--webui-port",
+        "8081",
+        "--cores",
+        "2",
+        "--memory",
+        "2g"
+      ]
+    volumes:
+      - spark-events:/opt/spark/events
+      - ${DATA_DIR:?set DATA_DIR in .env}:/data:ro
+      - ${STORAGE_DIR:?set STORAGE_DIR in .env}:/storage
+      - ./spark_batch.py:/opt/spark/apps/spark_batch.py:ro
+    networks:
+      - welding-net
+
+  airflow-init:
+    <<: *airflow-common
+    container_name: welding-airflow-init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate
+        airflow users create \
+          --username "${AIRFLOW_ADMIN_USER:-admin}" \
+          --password "${AIRFLOW_ADMIN_PASSWORD:-admin}" \
+          --firstname Air \
+          --lastname Flow \
+          --role Admin \
+          --email admin@local || true
+    restart: "no"
+
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: welding-airflow-webserver
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+      spark-master:
+        condition: service_started
+    command: webserver
+    ports:
+      - "${AIRFLOW_WEBSERVER_PORT:-18088}:8080"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8080/health', timeout=5)\"",
+        ]
+      interval: 20s
+      timeout: 10s
+      retries: 10
+    restart: unless-stopped
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: welding-airflow-scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+      spark-master:
+        condition: service_started
+    command: scheduler
+    restart: unless-stopped
 
   producer:
     build:
@@ -99,8 +272,11 @@ services:
     environment:
       KAFKA_BOOTSTRAP: kafka:9092
       TOPIC_RAW: welding.raw.v1
+      DATA_DIR: /data
+      STORAGE_DIR: /storage
     volumes:
-      - ${DATA_DIR:-./data}:/data:ro
+      - ${DATA_DIR:?set DATA_DIR in .env}:/data:ro
+      - ${STORAGE_DIR:?set STORAGE_DIR in .env}:/storage
     command:
       [
         "--data-dir",
@@ -117,6 +293,8 @@ volumes:
   zk-data:
   zk-log:
   kafka-data:
+  postgres-data:
+  spark-events:
 
 networks:
   welding-net:

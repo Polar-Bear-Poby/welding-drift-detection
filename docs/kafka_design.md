@@ -39,6 +39,13 @@ Producer는 `date + time + seq + line + batch + product_id`로 `product_instance
 10MB~20MB CSV = 여러 개의 Kafka message로 분할 전송
 ```
 
+생산라인 식별을 명확히 하기 위해 메시지 `metadata.file_name`에는
+원본 파일명 앞에 `"{line_number}_"` 접두어를 붙인다.
+
+```text
+예) 3_20220417_battery_10_laser_b.csv
+```
+
 메시지 예시는 [`sample_message.json`](sample_message.json)을 참고한다.
 전체 스키마는 [`message_schema.json`](message_schema.json)에 정의했다.
 
@@ -136,19 +143,20 @@ KAFKA_LOG_RETENTION_HOURS = 168
 ## 7. 데모 시나리오
 
 1. Docker Compose로 Kafka와 Kafka UI를 실행한다.
-2. `data/` 폴더에 CSV 파일을 넣는다.
+2. `.env`의 `DATA_DIR`에 지정한 로컬 전용 폴더에 CSV 파일을 둔다.
 3. Producer를 실행해 `welding.raw.v1`에 메시지를 발행한다.
 4. Kafka UI에서 topic, partition, message key, JSON payload를 확인한다.
+5. `metadata.file_name`이 `{line_number}_원본파일명` 규칙으로 발행되는지 확인한다.
 
 짧은 데모:
 
 ```bash
-uv run python producer.py --data-dir ./data --kafka localhost:29092 --max-products 3 --speed 100
+uv run python producer.py --kafka localhost:29092 --max-products 3 --speed 100
 ```
 
 부하 테스트:
 
 ```bash
-uv run python producer.py --data-dir ./data --kafka localhost:29092 --target-products 2000 --line-count 4 --speed 200 --no-schedule-wait
+uv run python producer.py --kafka localhost:29092 --target-products 2000 --line-count 4 --speed 200 --no-schedule-wait
 ```
 

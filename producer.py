@@ -11,9 +11,9 @@ chunks, and publishes the chunks to Kafka topic `welding.raw.v1`.
 
 Run examples
 ------------
-python producer.py --data-dir ./data --kafka localhost:29092 --speed 50
-python producer.py --data-dir ./data --target-products 2000 --speed 100
-python producer.py --data-dir ./data --dry-run
+python producer.py --kafka localhost:29092 --speed 50
+python producer.py --target-products 2000 --speed 100
+python producer.py --dry-run
 
 강사님께 설명할 핵심 흐름
 ------------------------
@@ -27,6 +27,7 @@ python producer.py --data-dir ./data --dry-run
 from __future__ import annotations
 
 import argparse
+import random
 import json
 import logging
 import os
@@ -43,11 +44,33 @@ from kafka import KafkaProducer
 from kafka.errors import KafkaError, NoBrokersAvailable
 
 
+def load_env_file(path: str = ".env") -> None:
+    """Load local .env values without adding an external dependency."""
+    env_path = Path(path)
+    if not env_path.exists():
+        return
+
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        os.environ.setdefault(key, value)
+
+
+load_env_file()
+
+
 LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 logging.basicConfig(level=logging.INFO, format=LOG_FORMAT, datefmt="%H:%M:%S")
 logger = logging.getLogger("welding.producer")
 
 
+DEFAULT_DATA_DIR = os.getenv("DATA_DIR") or None
+DEFAULT_STORAGE_DIR = os.getenv("STORAGE_DIR") or None
 TOPIC_RAW = os.getenv("TOPIC_RAW", "welding.raw.v1")
 DEFAULT_KAFKA = os.getenv("KAFKA_BOOTSTRAP", "localhost:29092")
 DEFAULT_CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "5000"))
@@ -70,6 +93,22 @@ SIMPLE_FILE_RE = re.compile(
 # internal_mapping.md 기준: MASKED_CH은 laser_b/LB, MASKED_CH은 laser_a/LA이다.
 LASER_NAME_TO_CHANNEL = {"laser_b": 0, "laser_a": 1}
 LASER_ID_TO_CHANNEL = {"LB": 0, "LA": 1}
+# internal_mapping.md 기준:
+#   MASKED_CH = 반사광(Reflected) = LaserB = channel 0
+#   MASKED_CH = 출사광(Emitted)   = LaserA = channel 1
+# concat_out_0       : 출사광(LaserA) CSV 묶음 → channel 1
+# concat_reflected_1 : 반사광(LaserB) CSV 묶음 → channel 0
+CHANNEL_FOLDER_TO_CHANNEL = {
+    "concat_out_0": 1,
+    "concat_reflected_1": 0,
+    "reflect": 0,
+    "laser_b": 0,
+    "out": 1,
+    "laser_a": 1,
+}
+DATE_RE = re.compile(r"^\d{8}$")
+TRAILING_CHANNEL_RE = re.compile(r"_(?:CH[01]|laser_[ab]|L[AB])$", re.IGNORECASE)
+TRAILING_DIGITS_RE = re.compile(r"(\d+)$")
 
 
 def parse_event_time(date_text: str, time_text: str) -> datetime:
@@ -133,6 +172,7 @@ class PublishItem:
     record: ProductRecord
     product_instance_id: str
     line_id: str
+    line_number: int
     event_time: datetime
     is_duplicate: bool = False
     original_product_instance_id: str | None = None
@@ -146,6 +186,32 @@ def build_instance_id(parts: dict[str, str]) -> str:
     )
 
 
+def infer_date_from_path(root: Path, csv_path: Path) -> str | None:
+    for path_part in csv_path.relative_to(root).parts:
+        if DATE_RE.match(path_part):
+            return path_part
+    return None
+
+
+def infer_channel_from_path(root: Path, csv_path: Path) -> int | None:
+    for path_part in csv_path.relative_to(root).parts:
+        channel = CHANNEL_FOLDER_TO_CHANNEL.get(path_part.lower())
+        if channel is not None:
+            return channel
+    return None
+
+
+def product_id_from_stem(stem: str) -> str:
+    return TRAILING_CHANNEL_RE.sub("", stem)
+
+
+def line_number_from_line_id(line_id: str) -> int:
+    matched = TRAILING_DIGITS_RE.search(line_id or "")
+    if matched:
+        return int(matched.group(1))
+    return 1
+
+
 def scan_data_dir(data_dir: str) -> list[ProductRecord]:
     """Scan CSV files and group them into line/product instances."""
     root = Path(data_dir)
@@ -157,6 +223,7 @@ def scan_data_dir(data_dir: str) -> list[ProductRecord]:
 
     for csv_path in sorted(root.glob("**/*.csv")):
         # 1순위: 제출 문서의 정식 파일명 규칙을 파싱한다.
+        folder_channel = infer_channel_from_path(root, csv_path)
         match = FILE_RE.match(csv_path.name)
         if match:
             parts = match.groupdict()
@@ -167,6 +234,8 @@ def scan_data_dir(data_dir: str) -> list[ProductRecord]:
                 if parts.get("laser_id")
                 else int(parts["channel"])
             )
+            if folder_channel is not None:
+                channel = folder_channel
             product_id = parts["product_id"]
             line_id = parts["line"]
             batch_id = parts["batch"]
@@ -176,26 +245,41 @@ def scan_data_dir(data_dir: str) -> list[ProductRecord]:
             # 2순위: 현재 데이터셋의 짧은 파일명 규칙을 파싱한다.
             # 예: 20220417_battery_10_laser_b.csv
             simple_match = SIMPLE_FILE_RE.match(csv_path.name)
-            if not simple_match:
-                ignored += 1
-                continue
+            if simple_match:
+                parts = simple_match.groupdict()
+                channel = (
+                    LASER_NAME_TO_CHANNEL[parts["laser"].lower()]
+                    if parts.get("laser")
+                    else int(parts["channel"])
+                )
+                if folder_channel is not None:
+                    channel = folder_channel
 
-            parts = simple_match.groupdict()
-            channel = (
-                LASER_NAME_TO_CHANNEL[parts["laser"].lower()]
-                if parts.get("laser")
-                else int(parts["channel"])
-            )
+                lead_num = 1
+                product_id = f"battery_{int(parts['battery_id'])}"
+                # 현재 샘플 데이터는 라인 정보가 파일명에 없으므로 기본 라인으로 시작한다.
+                # --line-count 옵션을 쓰면 발행 단계에서 LINE_01, LINE_02처럼 확장된다.
+                line_id = "LINE_01"
+                batch_id = parts["date"]
+                sequence_id = parts["battery_id"]
+                instance_id = f"{parts['date']}_{product_id}"
+                event_time = parse_event_time(parts["date"], "000000")
+            else:
+                # 3순위: DATA_DIR\{date}\out|reflect\*.csv 구조를 지원한다.
+                # 폴더명이 채널을 알려주면 파일명은 제품 id로 사용한다.
+                data_date = infer_date_from_path(root, csv_path)
+                if folder_channel is None or data_date is None:
+                    ignored += 1
+                    continue
 
-            lead_num = 1
-            product_id = f"battery_{int(parts['battery_id'])}"
-            # 현재 샘플 데이터는 라인 정보가 파일명에 없으므로 기본 라인으로 시작한다.
-            # --line-count 옵션을 쓰면 발행 단계에서 LINE_01, LINE_02처럼 확장된다.
-            line_id = "LINE_01"
-            batch_id = parts["date"]
-            sequence_id = parts["battery_id"]
-            instance_id = f"{parts['date']}_{product_id}"
-            event_time = parse_event_time(parts["date"], "000000")
+                channel = folder_channel
+                lead_num = 1
+                product_id = product_id_from_stem(csv_path.stem)
+                line_id = "LINE_01"
+                batch_id = data_date
+                sequence_id = product_id
+                instance_id = f"{data_date}_{product_id}"
+                event_time = parse_event_time(data_date, "000000")
 
         if instance_id not in records:
             # 같은 product_instance_id 아래에 laser_b와 laser_a CSV를 계속 모은다.
@@ -261,6 +345,7 @@ def make_message(
         f"{item.product_instance_id}:L{lead_num:02d}:"
         f"{chan_code}:{chunk_index:06d}"
     )
+    prefixed_file_name = f"{item.line_number}_{file_path.name}"
 
     return {
         "message_id": message_id,
@@ -284,7 +369,7 @@ def make_message(
         "metadata": {
             "source": "file_replay_producer",
             "version": PRODUCER_VERSION,
-            "file_name": file_path.name,
+            "file_name": prefixed_file_name,
             "original_product_instance_id": item.original_product_instance_id
             or item.record.product_instance_id,
             "is_duplicate": item.is_duplicate,
@@ -352,8 +437,14 @@ def make_publish_items(
     max_products: int | None,
     line_count: int,
     line_interval_seconds: float,
+    line_seeds: list[int] | None = None,
 ) -> list[PublishItem]:
-    """Create line-aware replay items for demo/load-test scenarios."""
+    """Create line-aware replay items for demo/load-test scenarios.
+
+    line_seeds: 각 생산라인이 제품을 전송하는 순서를 결정하는 random seed 목록.
+                길이가 line_count보다 짧으면 순환 사용한다.
+                None이면 원래 정렬 순서 그대로 사용한다.
+    """
     selected = records[:max_products] if max_products else records
     if not selected:
         return []
@@ -361,18 +452,31 @@ def make_publish_items(
     if line_count < 1:
         raise ValueError("line_count must be >= 1")
 
+    # 라인별로 제품 순서를 셔플한다 (seed가 주어진 경우).
+    per_line_records: list[list[ProductRecord]] = []
+    for line_index in range(line_count):
+        shuffled = list(selected)
+        if line_seeds:
+            seed = line_seeds[line_index % len(line_seeds)]
+            rng = random.Random(seed)
+            rng.shuffle(shuffled)
+        per_line_records.append(shuffled)
+
     total_products = target_products if target_products > 0 else len(selected) * line_count
     items: list[PublishItem] = []
     base_event_time = selected[0].event_time
 
     for index in range(total_products):
-        # index를 라인 수로 나눠 같은 원본 제품을 여러 생산라인에서 나온 데이터처럼 분산한다.
         line_index = index % line_count
+        line_number = line_index + 1
         product_index = index // line_count
-        source = selected[product_index % len(selected)]
+        line_pool = per_line_records[line_index]
+        source = line_pool[product_index % len(line_pool)]
         line_id = source.line_id if line_count == 1 else f"LINE_{line_index + 1:02d}"
-        is_replay = product_index >= len(selected) or line_id != source.line_id
-        replay_no = product_index // len(selected)
+        if line_count == 1:
+            line_number = line_number_from_line_id(line_id)
+        is_replay = product_index >= len(line_pool) or line_id != source.line_id
+        replay_no = product_index // len(line_pool)
         product_instance_id = (
             source.product_instance_id
             if not is_replay
@@ -384,8 +488,7 @@ def make_publish_items(
                 record=source,
                 product_instance_id=product_instance_id,
                 line_id=line_id if is_replay else source.line_id,
-                # 실제 센서 API 대신 각 생산라인이 10초마다 새 CSV를 생성한다고 가정한다.
-                # 같은 product_index의 여러 라인은 같은 시각에 병렬로 데이터가 생긴다.
+                line_number=line_number,
                 event_time=base_event_time
                 + timedelta(seconds=product_index * line_interval_seconds),
                 is_duplicate=is_replay,
@@ -468,9 +571,26 @@ def run(args: argparse.Namespace) -> int:
         records = [record for record in records if record.is_complete]
         logger.info("Filtered to complete product instances: %s", len(records))
 
+    # --oldest-date-only: 가장 오래된 event_date의 제품만 선택한다.
+    if args.oldest_date_only and records:
+        oldest_date = min(r.event_time.date() for r in records)
+        records = [r for r in records if r.event_time.date() == oldest_date]
+        logger.info(
+            "Filtered to oldest date %s: %s product instances", oldest_date, len(records)
+        )
+
     if not records:
         logger.error("No matching product files found.")
         return 2
+
+    # --line-seed: "1,2,3" 형식의 문자열을 정수 리스트로 변환한다.
+    line_seeds: list[int] | None = None
+    if args.line_seed:
+        try:
+            line_seeds = [int(s.strip()) for s in args.line_seed.split(",")]
+        except ValueError:
+            logger.error("--line-seed must be comma-separated integers, e.g. '1,2,3'")
+            return 1
 
     items = make_publish_items(
         records=records,
@@ -478,6 +598,7 @@ def run(args: argparse.Namespace) -> int:
         max_products=args.max_products,
         line_count=args.line_count,
         line_interval_seconds=args.line_interval_seconds,
+        line_seeds=line_seeds,
     )
 
     if args.dry_run:
@@ -486,6 +607,7 @@ def run(args: argparse.Namespace) -> int:
         lines = sorted({item.line_id for item in items})
         print("Dry run summary")
         print(f"- data_dir: {args.data_dir}")
+        print(f"- storage_dir: {args.storage_dir or '(not configured)'}")
         print(f"- product_instances: {len(items)}")
         print(f"- originals: {original_count}")
         print(f"- duplicates: {duplicate_count}")
@@ -555,7 +677,17 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         description="Welding CSV to Kafka producer",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--data-dir", required=True, help="CSV root directory")
+    parser.add_argument(
+        "--data-dir",
+        default=DEFAULT_DATA_DIR,
+        required=DEFAULT_DATA_DIR is None,
+        help="CSV root directory. Defaults to DATA_DIR from .env",
+    )
+    parser.add_argument(
+        "--storage-dir",
+        default=DEFAULT_STORAGE_DIR,
+        help="Future output/archive root directory. Defaults to STORAGE_DIR from .env",
+    )
     parser.add_argument("--kafka", default=DEFAULT_KAFKA, help="Kafka bootstrap server")
     parser.add_argument("--topic", default=TOPIC_RAW, help="Kafka topic")
     parser.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE)
@@ -596,6 +728,16 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--loop", action="store_true", help="Replay continuously")
     parser.add_argument("--dry-run", action="store_true", help="Scan and print summary only")
+    parser.add_argument(
+        "--oldest-date-only",
+        action="store_true",
+        help="Use only product instances from the oldest date folder found in data_dir",
+    )
+    parser.add_argument(
+        "--line-seed",
+        default=None,
+        help="Comma-separated random seeds for per-line shuffle, e.g. '1,2,3'",
+    )
     return parser.parse_args(argv)
 
 
