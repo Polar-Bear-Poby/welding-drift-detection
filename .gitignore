@@ -14,3 +14,6 @@ out/
 
 # local-only
 docs/internal_mapping.md
+*DIRECTION*.md
+*CONTEXT*.md
+*.log

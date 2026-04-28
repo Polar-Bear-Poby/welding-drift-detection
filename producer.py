@@ -34,6 +34,7 @@ import os
 import re
 import sys
 import time
+import hashlib
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -89,8 +90,12 @@ def setup_file_logger(storage_dir: str | None) -> None:
 DEFAULT_DATA_DIR = os.getenv("DATA_DIR") or None
 DEFAULT_STORAGE_DIR = os.getenv("STORAGE_DIR") or None
 TOPIC_RAW = os.getenv("TOPIC_RAW", "welding.raw.v1")
+TOPIC_RAW_LASER_A = os.getenv("TOPIC_RAW_LASER_A", "")
+TOPIC_RAW_LASER_B = os.getenv("TOPIC_RAW_LASER_B", "")
 DEFAULT_KAFKA = os.getenv("KAFKA_BOOTSTRAP", "localhost:29092")
 DEFAULT_CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "5000"))
+TARGET_CHUNK_BYTES = int(os.getenv("TARGET_CHUNK_BYTES", "900000"))
+MAX_CHUNKS_PER_SIGNAL = int(os.getenv("MAX_CHUNKS_PER_SIGNAL", "2048"))
 SAMPLE_RATE_HZ = int(os.getenv("SAMPLE_RATE_HZ", "25000"))
 MAX_REQUEST_SIZE = int(os.getenv("MAX_REQUEST_SIZE", "5242880"))
 PRODUCER_VERSION = "v1"
@@ -351,11 +356,24 @@ def make_message(
     file_path: Path,
     samples: np.ndarray,
     chunk_index: int,
-    chunk_size: int,
     total_chunks: int,
+    chunk_size: int | None = None,
+    chunk_start: int | None = None,
+    chunk_end: int | None = None,
 ) -> dict:
-    start = chunk_index * chunk_size
-    end = min(start + chunk_size, len(samples))
+    if chunk_start is None:
+        if chunk_size is None:
+            raise ValueError("chunk_size is required when chunk_start is not provided")
+        chunk_start = chunk_index * chunk_size
+    if chunk_end is None:
+        if chunk_size is None:
+            raise ValueError("chunk_size is required when chunk_end is not provided")
+        chunk_end = min(chunk_start + chunk_size, len(samples))
+
+    start = int(chunk_start)
+    end = int(chunk_end)
+    chunk_values = np.asarray(samples[start:end], dtype=np.float32)
+    chunk_checksum = hashlib.sha1(chunk_values.tobytes()).hexdigest()
     chan_code = channel_code(channel)
     # message_id는 Consumer/DB에서 중복 저장을 막기 위한 결정론적 id이다.
     message_id = (
@@ -381,7 +399,7 @@ def make_message(
         "sample_rate_hz": SAMPLE_RATE_HZ,
         "start_sample": start,
         "end_sample": end,
-        "samples": samples[start:end].tolist(),
+        "samples": chunk_values.tolist(),
         "event_time": isoformat_z(item.event_time),
         "metadata": {
             "source": "file_replay_producer",
@@ -391,8 +409,64 @@ def make_message(
             or item.record.product_instance_id,
             "is_duplicate": item.is_duplicate,
             "replay_iteration": item.replay_iteration,
+            "chunk_checksum": chunk_checksum,
         },
     }
+
+
+def _json_token_size(sample: float) -> int:
+    """Return utf-8 byte size for one JSON float token."""
+    return len(
+        json.dumps(float(sample), ensure_ascii=False, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    )
+
+
+def split_signal_into_byte_chunks(
+    signal: np.ndarray, target_chunk_bytes: int
+) -> list[tuple[int, int]]:
+    """
+    Split signal into variable-size chunks based on approximate JSON payload bytes.
+
+    The estimate follows JSON array representation: `[s1,s2,...]`.
+    """
+    if target_chunk_bytes <= 64:
+        raise ValueError("target_chunk_bytes must be > 64")
+    if len(signal) == 0:
+        return []
+
+    ranges: list[tuple[int, int]] = []
+    chunk_start = 0
+    current_bytes = 2  # '[' + ']'
+    current_count = 0
+
+    for idx, value in enumerate(signal):
+        token_bytes = _json_token_size(float(value))
+        add_bytes = token_bytes + (1 if current_count > 0 else 0)
+
+        if current_count > 0 and (current_bytes + add_bytes) > target_chunk_bytes:
+            ranges.append((chunk_start, idx))
+            chunk_start = idx
+            current_bytes = 2 + token_bytes
+            current_count = 1
+        else:
+            current_bytes += add_bytes
+            current_count += 1
+
+    if current_count > 0:
+        ranges.append((chunk_start, len(signal)))
+
+    if len(ranges) > MAX_CHUNKS_PER_SIGNAL:
+        merged: list[tuple[int, int]] = []
+        merge_step = int(math.ceil(len(ranges) / MAX_CHUNKS_PER_SIGNAL))
+        for i in range(0, len(ranges), merge_step):
+            start = ranges[i][0]
+            end = ranges[min(i + merge_step - 1, len(ranges) - 1)][1]
+            merged.append((start, end))
+        ranges = merged
+
+    return ranges
 
 
 def build_producer(kafka_bootstrap: str, retries: int = 8) -> KafkaProducer:
@@ -521,12 +595,19 @@ def publish_product(
     producer: KafkaProducer,
     item: PublishItem,
     topic: str,
+    topic_laser_a: str | None,
+    topic_laser_b: str | None,
     chunk_size: int,
+    target_chunk_bytes: int | None,
     speed: float,
 ) -> int:
     """Publish all available leads/channels for one product instance."""
     sent = 0
     record = item.record
+    topic_by_channel = {
+        0: topic_laser_b or topic,
+        1: topic_laser_a or topic,
+    }
 
     for lead_num in sorted(record.leads_present):
         # 한 제품 안에서 laser_b(channel 0), laser_a(channel 1)를 순서대로 발행한다.
@@ -547,7 +628,20 @@ def publish_product(
                 logger.error("Failed to load %s: %s", file_path, exc)
                 continue
 
-            total_chunks = max(1, int(np.ceil(len(signal) / chunk_size)))
+            _ = chunk_size  # backward compatibility for CLI argument.
+            target_bytes = target_chunk_bytes or TARGET_CHUNK_BYTES
+            chunk_ranges = split_signal_into_byte_chunks(
+                signal, target_chunk_bytes=target_bytes
+            )
+            if not chunk_ranges:
+                logger.warning(
+                    "No chunk generated. product=%s lead=%s channel=%s",
+                    item.product_instance_id,
+                    lead_num,
+                    channel,
+                )
+                continue
+            total_chunks = len(chunk_ranges)
             chan_code = channel_code(channel)
             # partition key에 line/product/lead/laser를 넣어 같은 신호의 chunk가 같은 파티션에 쌓이게 한다.
             partition_key = (
@@ -555,7 +649,7 @@ def publish_product(
                 f"L{lead_num:02d}_{chan_code}"
             )
 
-            for chunk_index in range(total_chunks):
+            for chunk_index, (chunk_start, chunk_end) in enumerate(chunk_ranges):
                 # 큰 CSV 전체를 한 메시지로 보내지 않고 chunk로 나눠 broker/message size 부담을 줄인다.
                 message = make_message(
                     item=item,
@@ -564,17 +658,19 @@ def publish_product(
                     file_path=file_path,
                     samples=signal,
                     chunk_index=chunk_index,
-                    chunk_size=chunk_size,
                     total_chunks=total_chunks,
+                    chunk_start=chunk_start,
+                    chunk_end=chunk_end,
                 )
-                producer.send(topic, key=partition_key, value=message).add_callback(
+                target_topic = topic_by_channel[channel]
+                producer.send(target_topic, key=partition_key, value=message).add_callback(
                     on_send_success
                 ).add_errback(on_send_error)
                 sent += 1
 
                 if speed > 0:
                     # speed는 "제품 간격"이 아니라 한 제품 내부 신호 chunk의 재생 속도이다.
-                    delay_seconds = (chunk_size / SAMPLE_RATE_HZ) / speed
+                    delay_seconds = ((chunk_end - chunk_start) / SAMPLE_RATE_HZ) / speed
                     if delay_seconds >= 0.002:
                         time.sleep(delay_seconds)
 
@@ -634,7 +730,8 @@ def run(args: argparse.Namespace) -> int:
         print(f"- lines: {', '.join(lines)}")
         print(f"- line_count: {args.line_count}")
         print(f"- line_interval_seconds: {args.line_interval_seconds}")
-        print(f"- topic: {args.topic}")
+        print(f"- topic_laser_a: {args.topic_laser_a or args.topic}")
+        print(f"- topic_laser_b: {args.topic_laser_b or args.topic}")
         return 0
 
     producer = build_producer(args.kafka)
@@ -660,7 +757,10 @@ def run(args: argparse.Namespace) -> int:
                     producer=producer,
                     item=item,
                     topic=args.topic,
+                    topic_laser_a=args.topic_laser_a,
+                    topic_laser_b=args.topic_laser_b,
                     chunk_size=args.chunk_size,
+                    target_chunk_bytes=args.target_chunk_bytes,
                     speed=args.speed,
                 )
                 pub_elapsed = time.monotonic() - pub_start
@@ -721,8 +821,33 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         help="Future output/archive root directory. Defaults to STORAGE_DIR from .env",
     )
     parser.add_argument("--kafka", default=DEFAULT_KAFKA, help="Kafka bootstrap server")
-    parser.add_argument("--topic", default=TOPIC_RAW, help="Kafka topic")
-    parser.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE)
+    parser.add_argument(
+        "--topic",
+        default=TOPIC_RAW,
+        help="Fallback Kafka topic used when per-channel topics are not set.",
+    )
+    parser.add_argument(
+        "--topic-laser-a",
+        default=TOPIC_RAW_LASER_A or None,
+        help="Kafka topic for Laser A (channel=1). Defaults to --topic when omitted.",
+    )
+    parser.add_argument(
+        "--topic-laser-b",
+        default=TOPIC_RAW_LASER_B or None,
+        help="Kafka topic for Laser B (channel=0). Defaults to --topic when omitted.",
+    )
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=DEFAULT_CHUNK_SIZE,
+        help="Deprecated compatibility option. Chunking uses TARGET_CHUNK_BYTES.",
+    )
+    parser.add_argument(
+        "--target-chunk-bytes",
+        type=int,
+        default=TARGET_CHUNK_BYTES,
+        help="Target JSON payload size (bytes) per chunk.",
+    )
     parser.add_argument("--speed", type=float, default=50.0, help="Replay speed multiplier")
     parser.add_argument(
         "--line-count",

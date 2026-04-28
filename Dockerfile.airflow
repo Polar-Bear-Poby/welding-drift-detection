@@ -1,0 +1,31 @@
+# Airflow 3 Production-ready Image
+FROM apache/airflow:3.0.1
+
+USER root
+# uv 설치
+COPY --from=ghcr.io/astral-sh/uv:0.11.7 /uv /uvx /bin/
+
+# 시스템 라이브러리 설치
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    libpq-dev \
+    curl \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# 패키지 설치 (Root 권한으로 시스템 영역에 설치)
+# Airflow 3에서는 FAB 및 Standard Provider가 분리되어 명시적 설치가 권장됩니다.
+RUN uv pip install --system \
+    psycopg2-binary \
+    apache-airflow-providers-apache-spark \
+    apache-airflow-providers-postgres \
+    apache-airflow-providers-common-sql \
+    apache-airflow-providers-fab \
+    apache-airflow-providers-standard
+
+# 에어플로우 작업 디렉토리 권한 설정
+RUN mkdir -p /opt/airflow/dags /opt/airflow/logs /opt/airflow/plugins \
+    && chown -R airflow:root /opt/airflow
+
+USER airflow
+WORKDIR /opt/airflow

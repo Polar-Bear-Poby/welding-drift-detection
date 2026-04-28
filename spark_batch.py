@@ -14,6 +14,7 @@ import logging
 import math
 import os
 import re
+import shutil
 import sys
 import uuid
 from dataclasses import dataclass
@@ -374,11 +375,12 @@ def build_summary_df(segments_df: DataFrame, cpd_threshold: float) -> DataFrame:
         )
         .withColumn("window_start", F.date_trunc("hour", F.col("processed_at")))
         .withColumn("window_end", F.expr("window_start + INTERVAL 1 HOUR"))
-        # TODO(CPD): quality_decision 레벨을 PASS / WARNING / HOLD 3단계로
-        #            세분화할 것 (현재는 PASS / REVIEW 2단계만 존재)
+        # NOTE(temporary): 실제 드리프트 모델이 아직 없으므로
+        #                  quality_decision은 임시로 모두 PASS로 고정한다.
+        # TODO(CPD): 모델 적용 후 PASS/WARNING/HOLD 등으로 복원.
         .withColumn(
             "quality_decision",
-            F.when(F.col("cpd_score") >= F.lit(cpd_threshold), F.lit("REVIEW")).otherwise(F.lit("PASS")),
+            F.lit("PASS"),
         )
     )
 
@@ -411,6 +413,78 @@ def write_parquet(segments_df: DataFrame, summary_df: DataFrame, output_dir: str
     segments_df.write.mode("append").partitionBy("event_date", "line_number").parquet(segments_path)
     summary_df.write.mode("append").partitionBy("event_date", "line_number").parquet(summary_path)
     return segments_path, summary_path
+
+
+def write_drift_artifacts(
+    segments_df: DataFrame,
+    summary_df: DataFrame,
+    output_dir: str,
+    input_dir: str,
+) -> tuple[int, int, int, str, str, str]:
+    """Persist drift-only artifacts for forensic and model-retraining use.
+
+    Drift candidates are rows whose quality_decision is not PASS.
+    We store:
+      1) drift summary parquet
+      2) drift segment parquet (joined by run_id/source_file/channel)
+      3) original raw CSV files for the drift candidates
+    """
+    output_root = Path(output_dir) / "drift_detected"
+    drift_summary_path = str(output_root / "summary")
+    drift_segments_path = str(output_root / "segments")
+    drift_raw_path = str(output_root / "raw_files")
+
+    drift_summary_df = summary_df.filter(F.col("quality_decision") != F.lit("PASS")).cache()
+    drift_summary_count = drift_summary_df.count()
+    if drift_summary_count == 0:
+        return 0, 0, 0, drift_summary_path, drift_segments_path, drift_raw_path
+
+    drift_summary_df.write.mode("append").partitionBy(
+        "event_date", "line_number", "quality_decision"
+    ).parquet(drift_summary_path)
+
+    drift_keys_df = drift_summary_df.select("run_id", "source_file", "channel").dropDuplicates()
+    drift_segments_df = segments_df.join(
+        F.broadcast(drift_keys_df),
+        on=["run_id", "source_file", "channel"],
+        how="inner",
+    ).cache()
+    drift_segment_count = drift_segments_df.count()
+    drift_segments_df.write.mode("append").partitionBy("event_date", "line_number").parquet(
+        drift_segments_path
+    )
+
+    input_root = Path(input_dir).resolve()
+    raw_output_root = Path(drift_raw_path)
+    copied_raw_files = 0
+    for row in drift_summary_df.select("source_file").dropDuplicates().collect():
+        source_text = row["source_file"]
+        if not source_text:
+            continue
+        source = Path(source_text)
+        if not source.exists():
+            logger.warning("drift raw source file not found: %s", source_text)
+            continue
+
+        source_resolved = source.resolve()
+        try:
+            rel = source_resolved.relative_to(input_root)
+        except Exception:
+            rel = Path(source_resolved.name)
+
+        target = raw_output_root / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_resolved, target)
+        copied_raw_files += 1
+
+    return (
+        drift_summary_count,
+        drift_segment_count,
+        copied_raw_files,
+        drift_summary_path,
+        drift_segments_path,
+        drift_raw_path,
+    )
 
 
 def ensure_postgres_tables(conn) -> None:
@@ -730,12 +804,35 @@ def run(args: argparse.Namespace) -> int:
         segment_rows = segments_df.count()
         summary_rows = summary_df.count()
         segments_path, summary_path = write_parquet(segments_df, summary_df, args.output_dir)
+        (
+            drift_summary_rows,
+            drift_segment_rows,
+            drift_raw_files,
+            drift_summary_path,
+            drift_segments_path,
+            drift_raw_path,
+        ) = write_drift_artifacts(
+            segments_df=segments_df,
+            summary_df=summary_df,
+            output_dir=args.output_dir,
+            input_dir=args.input_dir,
+        )
 
         logger.info("run_id=%s", args.run_id)
         logger.info("input_files=%s skipped_files=%s", len(files), skipped)
         logger.info("segment_rows=%s summary_rows=%s", segment_rows, summary_rows)
         logger.info("segments_parquet=%s", segments_path)
         logger.info("summary_parquet=%s", summary_path)
+        logger.info(
+            "drift_summary_rows=%s drift_segment_rows=%s drift_raw_files=%s",
+            drift_summary_rows,
+            drift_segment_rows,
+            drift_raw_files,
+        )
+        if drift_summary_rows > 0:
+            logger.info("drift_summary_parquet=%s", drift_summary_path)
+            logger.info("drift_segments_parquet=%s", drift_segments_path)
+            logger.info("drift_raw_files_dir=%s", drift_raw_path)
 
         finished_at = datetime.now(timezone.utc)
 

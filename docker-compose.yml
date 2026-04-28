@@ -1,21 +1,32 @@
 x-airflow-common: &airflow-common
-  image: apache/airflow:2.9.3
-  profiles: ["airflow"]
+  build:
+    context: .
+    dockerfile: Dockerfile.airflow
+  image: welding-airflow:3.0.1
   user: "${AIRFLOW_UID:-50000}:0"
   environment:
+    &airflow-common-env
     AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    # PIP requirements are now in Dockerfile.airflow
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-welding}:${POSTGRES_PASSWORD:-welding_pass}@postgres:5432/${POSTGRES_DB:-welding_drift}
     AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:-}
     AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__FAB__AUTH_ROLE_PUBLIC: "Admin"
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "True"
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
     AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
     AIRFLOW_CONN_KAFKA_DEFAULT: kafka://kafka:9092
     AIRFLOW_CONN_SPARK_DEFAULT: spark://spark-master:7077
     AIRFLOW_CONN_WELDING_POSTGRES: postgresql://${POSTGRES_USER:-welding}:${POSTGRES_PASSWORD:-welding_pass}@postgres:5432/${POSTGRES_DB:-welding_drift}
+    # Airflow 3 Auth Manager explicit setting
+    AIRFLOW__CORE__AUTH_MANAGER: "airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager"
+    DOCKER_HOST: unix:///var/run/docker.sock
   volumes:
     - ./airflow/dags:/opt/airflow/dags
     - ./airflow/logs:/opt/airflow/logs
     - ./airflow/plugins:/opt/airflow/plugins
+    - ./scripts:/opt/airflow/scripts:ro
+    - /var/run/docker.sock:/var/run/docker.sock
   networks:
     - welding-net
   depends_on:
@@ -80,6 +91,32 @@ services:
       retries: 15
       start_period: 30s
 
+  airflow-dag-processor:
+    <<: *airflow-common
+    command: dag-processor
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "airflow", "jobs", "check", "--job-type", "DagProcessorJob"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  airflow-triggerer:
+    <<: *airflow-common
+    command: triggerer
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type TriggererJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
   kafka-init:
     image: confluentinc/cp-kafka:7.5.3
     container_name: welding-kafka-init
@@ -91,6 +128,8 @@ services:
       - |
         echo 'Creating Kafka topics'
         kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic welding.raw.v1 --partitions 8 --replication-factor 1 --config retention.ms=604800000 --config compression.type=producer --config max.message.bytes=5242880
+        kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic welding.raw.laser_a.v1 --partitions 8 --replication-factor 1 --config retention.ms=604800000 --config compression.type=producer --config max.message.bytes=5242880
+        kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic welding.raw.laser_b.v1 --partitions 8 --replication-factor 1 --config retention.ms=604800000 --config compression.type=producer --config max.message.bytes=5242880
         kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic welding.validated.v1 --partitions 8 --replication-factor 1 --config retention.ms=604800000 --config compression.type=producer
         kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic welding.features.v1 --partitions 8 --replication-factor 1 --config retention.ms=2592000000 --config cleanup.policy=compact,delete --config compression.type=producer
         kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic welding.quality_decision.v1 --partitions 4 --replication-factor 1 --config retention.ms=2592000000
@@ -108,7 +147,7 @@ services:
       kafka:
         condition: service_healthy
     ports:
-      - "${KAFKA_UI_PORT:-8080}:8080"
+      - "${KAFKA_UI_PORT:-8089}:8080"
     environment:
       KAFKA_CLUSTERS_0_NAME: welding-local
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
@@ -168,6 +207,7 @@ services:
       - ${DATA_DIR:?set DATA_DIR in .env}:/data:ro
       - ${STORAGE_DIR:?set STORAGE_DIR in .env}:/storage
       - ./spark_batch.py:/opt/spark/apps/spark_batch.py:ro
+      - ./spark_streaming.py:/opt/spark/apps/spark_streaming.py:ro
     networks:
       - welding-net
 
@@ -200,6 +240,7 @@ services:
       - ${DATA_DIR:?set DATA_DIR in .env}:/data:ro
       - ${STORAGE_DIR:?set STORAGE_DIR in .env}:/storage
       - ./spark_batch.py:/opt/spark/apps/spark_batch.py:ro
+      - ./spark_streaming.py:/opt/spark/apps/spark_streaming.py:ro
     networks:
       - welding-net
 
@@ -211,13 +252,6 @@ services:
       - -c
       - |
         airflow db migrate
-        airflow users create \
-          --username "${AIRFLOW_ADMIN_USER:-admin}" \
-          --password "${AIRFLOW_ADMIN_PASSWORD:-admin}" \
-          --firstname Air \
-          --lastname Flow \
-          --role Admin \
-          --email admin@local || true
     restart: "no"
 
   airflow-webserver:
@@ -232,18 +266,18 @@ services:
         condition: service_completed_successfully
       spark-master:
         condition: service_started
-    command: webserver
+    command: api-server
     ports:
-      - "${AIRFLOW_WEBSERVER_PORT:-18088}:8080"
+      - "${AIRFLOW_WEBSERVER_PORT:-8080}:8080"
     healthcheck:
       test:
         [
           "CMD-SHELL",
-          "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8080/health', timeout=5)\"",
+          "curl -f http://localhost:8080/api/v2/monitor/health || exit 1",
         ]
-      interval: 20s
+      interval: 30s
       timeout: 10s
-      retries: 10
+      retries: 5
     restart: unless-stopped
 
   airflow-scheduler:
@@ -272,11 +306,14 @@ services:
     environment:
       KAFKA_BOOTSTRAP: kafka:9092
       TOPIC_RAW: welding.raw.v1
+      TOPIC_RAW_LASER_A: welding.raw.laser_a.v1
+      TOPIC_RAW_LASER_B: welding.raw.laser_b.v1
       DATA_DIR: /data
       STORAGE_DIR: /storage
     volumes:
       - ${DATA_DIR:?set DATA_DIR in .env}:/data:ro
       - ${STORAGE_DIR:?set STORAGE_DIR in .env}:/storage
+      - ./producer.py:/app/producer.py:ro
     command:
       [
         "--data-dir",

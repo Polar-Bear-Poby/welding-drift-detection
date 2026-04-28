@@ -67,3 +67,45 @@ CREATE INDEX IF NOT EXISTS idx_pattern_segment_event
 
 CREATE INDEX IF NOT EXISTS idx_pattern_summary_event
     ON welding.pattern_summary (event_date, line_number, quality_decision);
+
+-- Airflow daily_quality_report DAG가 매일 집계한 라인별 품질 트렌드를 저장
+CREATE TABLE IF NOT EXISTS welding.daily_report (
+    report_date     DATE        NOT NULL,
+    line_id         TEXT        NOT NULL,
+    channel         SMALLINT    NOT NULL,
+    total_products  INTEGER     NOT NULL DEFAULT 0,
+    pass_count      INTEGER     NOT NULL DEFAULT 0,
+    review_count    INTEGER     NOT NULL DEFAULT 0,
+    error_count     INTEGER     NOT NULL DEFAULT 0,
+    avg_cpd_score   DOUBLE PRECISION,
+    max_cpd_score   DOUBLE PRECISION,
+    -- 전일 대비 cpd_score 변화율 (drift trend 핵심 지표)
+    cpd_score_delta DOUBLE PRECISION,
+    generated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (report_date, line_id, channel)
+);
+
+CREATE INDEX IF NOT EXISTS idx_daily_report_date
+    ON welding.daily_report (report_date DESC);
+
+-- welding_weekly_drift_trend DAG가 매주 월요일 집계한 라인별 장기 드리프트 트렌드
+CREATE TABLE IF NOT EXISTS welding.weekly_trend (
+    week_start      DATE            NOT NULL,
+    week_end        DATE            NOT NULL,
+    line_id         TEXT            NOT NULL,
+    channel         SMALLINT        NOT NULL,
+    days_with_data  INTEGER         NOT NULL DEFAULT 0,
+    total_products  INTEGER         NOT NULL DEFAULT 0,
+    avg_cpd_score   DOUBLE PRECISION,
+    max_cpd_score   DOUBLE PRECISION,
+    -- 선형 회귀 기울기: 양수=악화 추세, 음수=개선 추세
+    cpd_trend_slope DOUBLE PRECISION,
+    -- 장기 드리프트 판정 플래그
+    long_term_drift BOOLEAN         NOT NULL DEFAULT FALSE,
+    pass_rate       DOUBLE PRECISION,
+    generated_at    TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (week_start, line_id, channel)
+);
+
+CREATE INDEX IF NOT EXISTS idx_weekly_trend_week
+    ON welding.weekly_trend (week_start DESC);

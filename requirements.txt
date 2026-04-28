@@ -2,3 +2,8 @@ numpy==1.26.4
 kafka-python==2.0.2
 psycopg2-binary==2.9.9
 pyspark==3.5.1
+
+# Airflow DAG 의존성
+apache-airflow-providers-apache-spark==4.7.2
+apache-airflow-providers-postgres==5.10.2
+docker==7.1.0

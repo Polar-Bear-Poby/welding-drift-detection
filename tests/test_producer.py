@@ -134,12 +134,24 @@ class ProducerUnitTests(unittest.TestCase):
             self.assertEqual(message["end_sample"], 4)
             self.assertTrue(message["is_last_chunk"])
             self.assertEqual(message["metadata"]["file_name"], "1_20220417_battery_10_laser_b.csv")
+            self.assertIn("chunk_checksum", message["metadata"])
+
+    def test_split_signal_into_byte_chunks_is_contiguous(self):
+        signal = np.array([float(i) for i in range(25)], dtype=np.float32)
+        ranges = producer.split_signal_into_byte_chunks(signal, target_chunk_bytes=80)
+
+        self.assertGreater(len(ranges), 1)
+        self.assertEqual(ranges[0][0], 0)
+        self.assertEqual(ranges[-1][1], len(signal))
+        for i in range(1, len(ranges)):
+            self.assertEqual(ranges[i - 1][1], ranges[i][0])
+            self.assertLess(ranges[i][0], ranges[i][1])
 
     def test_publish_product_sends_chunked_messages_with_partition_keys(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            write_signal(root / "20220417_battery_10_laser_b.csv", [0.1, 0.2, 0.3, 0.4, 0.5])
-            write_signal(root / "20220417_battery_10_laser_a.csv", [0.6, 0.7, 0.8, 0.9, 1.0])
+            write_signal(root / "20220417_battery_10_laser_b.csv", [float(i) for i in range(20)])
+            write_signal(root / "20220417_battery_10_laser_a.csv", [float(i) for i in range(20, 40)])
 
             record = producer.scan_data_dir(str(root))[0]
             item = producer.make_publish_items([record], 0, 1, 1, 10)[0]
@@ -149,17 +161,68 @@ class ProducerUnitTests(unittest.TestCase):
                 producer=fake_producer,
                 item=item,
                 topic="test.topic",
+                topic_laser_a=None,
+                topic_laser_b=None,
                 chunk_size=3,
+                target_chunk_bytes=80,
                 speed=0,
             )
 
-            self.assertEqual(sent_count, 4)
-            self.assertEqual(len(fake_producer.sent), 4)
+            expected_chunks_per_channel = len(
+                producer.split_signal_into_byte_chunks(
+                    np.array([float(i) for i in range(20)], dtype=np.float32),
+                    target_chunk_bytes=80,
+                )
+            )
+            self.assertEqual(sent_count, expected_chunks_per_channel * 2)
+            self.assertEqual(len(fake_producer.sent), expected_chunks_per_channel * 2)
             keys = [sent["key"] for sent in fake_producer.sent]
-            self.assertEqual(keys[:2], ["LINE_01_20220417_battery_10_L01_LB"] * 2)
-            self.assertEqual(keys[2:], ["LINE_01_20220417_battery_10_L01_LA"] * 2)
+            self.assertEqual(
+                keys[:expected_chunks_per_channel],
+                ["LINE_01_20220417_battery_10_L01_LB"] * expected_chunks_per_channel,
+            )
+            self.assertEqual(
+                keys[expected_chunks_per_channel:],
+                ["LINE_01_20220417_battery_10_L01_LA"] * expected_chunks_per_channel,
+            )
             self.assertEqual(fake_producer.sent[0]["value"]["chunk_index"], 0)
             self.assertEqual(fake_producer.sent[1]["value"]["chunk_index"], 1)
+            self.assertEqual(
+                fake_producer.sent[0]["value"]["total_chunks"], expected_chunks_per_channel
+            )
+            self.assertEqual(
+                fake_producer.sent[expected_chunks_per_channel - 1]["value"]["chunk_index"],
+                expected_chunks_per_channel - 1,
+            )
+            self.assertEqual(
+                fake_producer.sent[expected_chunks_per_channel]["value"]["chunk_index"], 0
+            )
+
+    def test_publish_product_routes_messages_to_channel_topics(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_signal(root / "20220417_battery_10_laser_b.csv", [0.1, 0.2, 0.3, 0.4])
+            write_signal(root / "20220417_battery_10_laser_a.csv", [0.5, 0.6, 0.7, 0.8])
+
+            record = producer.scan_data_dir(str(root))[0]
+            item = producer.make_publish_items([record], 0, 1, 1, 10)[0]
+            fake_producer = FakeProducer()
+
+            producer.publish_product(
+                producer=fake_producer,
+                item=item,
+                topic="test.topic.fallback",
+                topic_laser_a="test.topic.laser_a",
+                topic_laser_b="test.topic.laser_b",
+                chunk_size=3,
+                target_chunk_bytes=80,
+                speed=0,
+            )
+
+            topics = {sent["topic"] for sent in fake_producer.sent}
+            self.assertIn("test.topic.laser_a", topics)
+            self.assertIn("test.topic.laser_b", topics)
+            self.assertNotIn("test.topic.fallback", topics)
 
 
 if __name__ == "__main__":
