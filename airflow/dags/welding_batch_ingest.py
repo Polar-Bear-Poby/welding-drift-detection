@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import uuid
 from datetime import datetime, timedelta
 
 import psycopg2
@@ -45,6 +46,14 @@ PRODUCER_CONTAINER = os.getenv("PRODUCER_CONTAINER", "welding-producer")
 )
 def welding_batch_ingest_dag():
 
+    @task()
+    def prepare_run_context(ds=None) -> dict:
+        """Create deterministic context for this DAG run."""
+        return {
+            "run_id": str(uuid.uuid4()),
+            "event_date": ds,
+        }
+
     @task.short_circuit()
     def check_already_replayed(ds=None):
         """Skip if already replayed for this date."""
@@ -76,9 +85,13 @@ def welding_batch_ingest_dag():
         )
     )
 
-    run_spark_batch = BashOperator(
-        task_id="run_spark_batch",
-        bash_command=(
+    @task()
+    def run_spark_batch(run_context: dict):
+        """Run batch job and bind the result to this DAG run_id."""
+        import subprocess
+
+        run_id = run_context["run_id"]
+        cmd = (
             "docker exec welding-spark-master /opt/spark/bin/spark-submit "
             "--master spark://spark-master:7077 "
             "/opt/spark/apps/spark_batch.py "
@@ -90,31 +103,36 @@ def welding_batch_ingest_dag():
             f"--postgres-db {_PG_DB} "
             f"--postgres-user {_PG_USER} "
             f"--postgres-password {_PG_PASS} "
-            "--oldest-date-only"
-        ),
-    )
+            "--oldest-date-only "
+            f"--run-id {run_id}"
+        )
+        result = subprocess.run(cmd, shell=True, timeout=1800)
+        if result.returncode != 0:
+            raise RuntimeError(f"spark_batch.py failed: returncode={result.returncode}")
 
     @task(retries=3, retry_delay=timedelta(minutes=2))
-    def validate_results(ds=None):
-        """Verify latest Spark batch run completed and quality is acceptable."""
+    def validate_results(run_context: dict, ds=None):
+        """Verify this DAG run's Spark batch result and quality."""
+        run_id = run_context["run_id"]
         try:
             with psycopg2.connect(DB_CONN_STR) as conn:
                 with conn.cursor() as cur:
                     cur.execute(
                         """
-                        SELECT run_id, total_segment_rows, total_summary_rows
+                        SELECT status, total_segment_rows, total_summary_rows
                         FROM welding.spark_batch_run
-                        WHERE status = 'SUCCESS'
-                          AND finished_at >= NOW() - INTERVAL '30 minutes'
-                        ORDER BY finished_at DESC
-                        LIMIT 1
+                        WHERE run_id = %s
                         """
+                        ,
+                        (run_id,),
                     )
-                    latest = cur.fetchone()
-                    if latest is None:
-                        raise RuntimeError("No successful spark_batch_run found in the last 30 minutes.")
+                    row = cur.fetchone()
+                    if row is None:
+                        raise RuntimeError(f"No spark_batch_run found for run_id={run_id}.")
 
-                    run_id, seg_rows, sum_rows = latest
+                    status, seg_rows, sum_rows = row
+                    if status != "SUCCESS":
+                        raise RuntimeError(f"Spark batch run {run_id} status={status} (not SUCCESS).")
                     if sum_rows == 0:
                         raise RuntimeError(f"Spark batch run {run_id} produced 0 summary rows.")
 
@@ -173,9 +191,11 @@ def welding_batch_ingest_dag():
 
     # Dependency Flow
     gate = check_already_replayed()
-    validation = validate_results()
+    run_context = prepare_run_context()
+    run_spark = run_spark_batch(run_context)
+    validation = validate_results(run_context)
     heartbeat = report_heartbeat(validation)
-    gate >> run_producer >> run_spark_batch >> validation >> heartbeat
+    gate >> run_context >> run_producer >> run_spark >> validation >> heartbeat
 
 # Instantiate
 welding_batch_ingest_dag()

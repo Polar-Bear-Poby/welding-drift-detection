@@ -6,8 +6,10 @@ Modern TaskFlow API with Branching for Airflow 3.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import urllib.request
 from datetime import datetime, timedelta
 
 import psycopg2
@@ -25,6 +27,7 @@ DB_CONN_STR = (
     f"host={_PG_HOST} port={_PG_PORT} dbname={_PG_DB} "
     f"user={_PG_USER} password={_PG_PASS}"
 )
+ALERT_WEBHOOK_URL = os.getenv("ALERT_WEBHOOK_URL", "").strip()
 HEALTH_WINDOW_MIN = 15
 TOPIC_RAW_LASER_A = os.getenv("TOPIC_RAW_LASER_A", "welding.raw.laser_a.v1")
 TOPIC_RAW_LASER_B = os.getenv("TOPIC_RAW_LASER_B", "welding.raw.laser_b.v1")
@@ -84,6 +87,28 @@ def _recent_channel_counts(window_minutes: int) -> tuple[int, int]:
         counts[source_file] = int(count)
     return counts[SOURCE_LASER_A], counts[SOURCE_LASER_B]
 
+
+def _send_external_alert(title: str, details: dict) -> None:
+    """Send optional external alert to webhook endpoint."""
+    if not ALERT_WEBHOOK_URL:
+        return
+    payload = {
+        "text": title,
+        "details": details,
+    }
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        ALERT_WEBHOOK_URL,
+        data=body,
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5):
+            pass
+    except Exception as exc:
+        log.warning("External alert webhook failed: %s", exc)
+
 @dag(
     dag_id="welding_streaming_monitor",
     schedule="*/10 * * * *",
@@ -107,7 +132,7 @@ def welding_streaming_monitor_dag():
             return "log_healthy_heartbeat" if (a_count > 0 and b_count > 0) else "restart_spark_streaming"
         except Exception as e:
             log.error(f"Health check failed: {e}")
-            return "log_healthy_heartbeat"
+            return "restart_spark_streaming"
 
     @task()
     def log_healthy_heartbeat():
@@ -148,12 +173,15 @@ def welding_streaming_monitor_dag():
 
     @task(trigger_rule="one_failed")
     def notify_failure():
+        details = {"status": "restart_failed"}
         with psycopg2.connect(DB_CONN_STR) as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     "INSERT INTO welding.pipeline_heartbeat (component_name, details) "
-                    "VALUES ('airflow.streaming_monitor', '{\"status\":\"restart_failed\"}'::jsonb)"
+                    "VALUES (%s, %s::jsonb)",
+                    ("airflow.streaming_monitor", "{\"status\":\"restart_failed\"}"),
                 )
+        _send_external_alert("welding_streaming_monitor restart failed", details)
 
     # Dependency Flow
     branch = check_streaming_health()

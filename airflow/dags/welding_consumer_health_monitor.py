@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import subprocess
+import urllib.request
 from datetime import datetime, timedelta
 
 import psycopg2
@@ -36,6 +37,7 @@ _PG_DB   = os.getenv("POSTGRES_DB",   "welding_drift")
 _PG_USER = os.getenv("POSTGRES_USER", "welding")
 _PG_PASS = os.getenv("POSTGRES_PASSWORD", "welding_pass")
 DB_CONN_STR = f"host={_PG_HOST} port={_PG_PORT} dbname={_PG_DB} user={_PG_USER} password={_PG_PASS}"
+ALERT_WEBHOOK_URL = os.getenv("ALERT_WEBHOOK_URL", "").strip()
 
 KAFKA_CONTAINER  = "welding-kafka"
 KAFKA_BOOTSTRAP  = "kafka:9092"
@@ -93,6 +95,24 @@ RESTART_CMD = (
     "    /opt/spark/apps/spark_streaming.py >/tmp/spark_streaming_consumer_${consumer_id}.log 2>&1 & "
     "done;'"
 )
+
+
+def _send_external_alert(title: str, details: dict) -> None:
+    """Send optional external alert to webhook endpoint."""
+    if not ALERT_WEBHOOK_URL:
+        return
+    body = json.dumps({"text": title, "details": details}).encode("utf-8")
+    req = urllib.request.Request(
+        ALERT_WEBHOOK_URL,
+        data=body,
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5):
+            pass
+    except Exception as exc:
+        log.warning("External alert webhook failed: %s", exc)
 
 
 def _get_group_member_count(group_id: str) -> int:
@@ -261,6 +281,11 @@ def welding_consumer_health_monitor_dag():
                         json.dumps({"status": status, "groups": group_status}),
                     ),
                 )
+        if not all_ok:
+            _send_external_alert(
+                "welding_consumer_health_monitor restart failed",
+                {"status": status, "groups": group_status},
+            )
 
     # ── 의존성 연결 ──────────────────────────────────────────────
     branch = check_consumer_count()

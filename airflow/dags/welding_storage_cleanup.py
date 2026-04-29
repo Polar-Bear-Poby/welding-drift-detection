@@ -30,7 +30,7 @@ from datetime import datetime, timedelta
 
 import psycopg2
 from airflow.decorators import dag, task
-from airflow.providers.standard.operators.bash import BashOperator
+from airflow.models.param import Param
 
 log = logging.getLogger(__name__)
 
@@ -64,6 +64,13 @@ DISK_USAGE_ALERT_THRESHOLD = 80
     start_date=datetime(2026, 4, 1),
     catchup=False,
     max_active_runs=1,
+    params={
+        "dry_run": Param(
+            default=False,
+            type="boolean",
+            description="True면 삭제 없이 대상만 집계한다.",
+        ),
+    },
     tags=["welding", "airflow3", "maintenance", "storage"],
     default_args={
         "owner": "welding-team",
@@ -147,6 +154,9 @@ def welding_storage_cleanup_dag():
         현재 실행 중인(or 최근 성공한) run_id 디렉토리는 제외.
         """
         import subprocess
+        from airflow.operators.python import get_current_context
+
+        dry_run = bool(get_current_context()["params"].get("dry_run", False))
 
         # DB에서 최근 7일 내 성공한 run_id 목록 조회 (보호 대상)
         protected_runs = set()
@@ -183,19 +193,23 @@ def welding_storage_cleanup_dag():
 
         deleted_count = 0
         if to_delete:
-            # 배치 삭제 (xargs 활용)
-            file_list = "\n".join(to_delete)
-            del_cmd = (
-                f"docker exec welding-spark-master bash -c "
-                f"\"echo '{file_list}' | xargs -r rm -f\""
-            )
-            subprocess.run(del_cmd, shell=True, timeout=120)
-            deleted_count = len(to_delete)
-            log.info("Parquet 파일 %d개 삭제 완료", deleted_count)
+            if dry_run:
+                log.info("dry_run=True, Parquet 삭제 생략. 대상 %d개", len(to_delete))
+            else:
+                # 배치 삭제 (xargs 활용)
+                file_list = "\n".join(to_delete)
+                del_cmd = (
+                    f"docker exec welding-spark-master bash -c "
+                    f"\"echo '{file_list}' | xargs -r rm -f\""
+                )
+                subprocess.run(del_cmd, shell=True, timeout=120)
+                deleted_count = len(to_delete)
+                log.info("Parquet 파일 %d개 삭제 완료", deleted_count)
         else:
             log.info("삭제 대상 Parquet 파일 없음")
 
         return {
+            "dry_run": dry_run,
             "parquet_candidates": len(candidate_files),
             "parquet_deleted": deleted_count,
             "parquet_protected": len(candidate_files) - deleted_count,
@@ -207,6 +221,9 @@ def welding_storage_cleanup_dag():
         /storage/logs/ 내 LOG_RETENTION_DAYS일 이상 된 로그 파일 삭제.
         """
         import subprocess
+        from airflow.operators.python import get_current_context
+
+        dry_run = bool(get_current_context()["params"].get("dry_run", False))
 
         find_cmd = (
             f"docker exec welding-spark-master find {STORAGE_LOGS_DIR} "
@@ -220,14 +237,17 @@ def welding_storage_cleanup_dag():
 
         deleted_count = 0
         if log_files:
-            file_list = "\n".join(log_files)
-            del_cmd = (
-                f"docker exec welding-spark-master bash -c "
-                f"\"echo '{file_list}' | xargs -r rm -f\""
-            )
-            subprocess.run(del_cmd, shell=True, timeout=60)
-            deleted_count = len(log_files)
-            log.info("로그 파일 %d개 삭제 완료", deleted_count)
+            if dry_run:
+                log.info("dry_run=True, 로그 삭제 생략. 대상 %d개", len(log_files))
+            else:
+                file_list = "\n".join(log_files)
+                del_cmd = (
+                    f"docker exec welding-spark-master bash -c "
+                    f"\"echo '{file_list}' | xargs -r rm -f\""
+                )
+                subprocess.run(del_cmd, shell=True, timeout=60)
+                deleted_count = len(log_files)
+                log.info("로그 파일 %d개 삭제 완료", deleted_count)
         else:
             log.info("삭제 대상 로그 파일 없음")
 
@@ -240,6 +260,9 @@ def welding_storage_cleanup_dag():
         현재 실행 중인 컨슈머의 체크포인트는 제외.
         """
         import subprocess
+        from airflow.operators.python import get_current_context
+
+        dry_run = bool(get_current_context()["params"].get("dry_run", False))
 
         # 실행 중인 컨슈머의 checkpoint 디렉토리 조회
         ps_result = subprocess.run(
@@ -270,11 +293,14 @@ def welding_storage_cleanup_dag():
 
         deleted_count = 0
         if to_delete:
-            for d in to_delete:
-                rm_cmd = f"docker exec welding-spark-master rm -rf {d}"
-                subprocess.run(rm_cmd, shell=True, timeout=30)
-                deleted_count += 1
-            log.info("Spark 체크포인트 디렉토리 %d개 삭제 완료", deleted_count)
+            if dry_run:
+                log.info("dry_run=True, 체크포인트 삭제 생략. 대상 %d개", len(to_delete))
+            else:
+                for d in to_delete:
+                    rm_cmd = f"docker exec welding-spark-master rm -rf {d}"
+                    subprocess.run(rm_cmd, shell=True, timeout=30)
+                    deleted_count += 1
+                log.info("Spark 체크포인트 디렉토리 %d개 삭제 완료", deleted_count)
         else:
             log.info("삭제 대상 체크포인트 없음")
 
@@ -299,6 +325,7 @@ def welding_storage_cleanup_dag():
 
         summary = {
             "status": "completed",
+            "dry_run": cleanup_result.get("dry_run", False),
             "disk_usage_before_pct": disk_info.get("usage_pct", -1),
             "parquet_deleted": cleanup_result.get("parquet_deleted", 0),
             "logs_deleted": cleanup_result.get("logs_deleted", 0),

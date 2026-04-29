@@ -26,6 +26,7 @@ import json
 import logging
 import os
 import subprocess
+import urllib.request
 from datetime import datetime, timedelta
 
 import psycopg2
@@ -43,6 +44,7 @@ DB_CONN_STR = (
     f"host={_PG_HOST} port={_PG_PORT} dbname={_PG_DB} "
     f"user={_PG_USER} password={_PG_PASS}"
 )
+ALERT_WEBHOOK_URL = os.getenv("ALERT_WEBHOOK_URL", "").strip()
 
 KAFKA_BOOTSTRAP = "kafka:9092"
 KAFKA_CONTAINER = "welding-kafka"
@@ -62,6 +64,24 @@ CONSUMER_GROUPS = [
 
 # Consumer Lag 경보 임계값 (파티션당 누적 미처리 메시지 수)
 LAG_ALERT_THRESHOLD = 10000
+
+
+def _send_external_alert(title: str, details: dict) -> None:
+    """Send optional external alert to webhook endpoint."""
+    if not ALERT_WEBHOOK_URL:
+        return
+    body = json.dumps({"text": title, "details": details}).encode("utf-8")
+    req = urllib.request.Request(
+        ALERT_WEBHOOK_URL,
+        data=body,
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5):
+            pass
+    except Exception as exc:
+        log.warning("External alert webhook failed: %s", exc)
 
 
 @dag(
@@ -178,6 +198,10 @@ def welding_kafka_topic_health_dag():
                         ),
                     ),
                 )
+        _send_external_alert(
+            "welding_kafka_topic_health recreated missing topics",
+            {"status": "topics_recreated", "topics": REQUIRED_TOPICS},
+        )
 
     @task()
     def check_consumer_lag() -> dict:
@@ -198,29 +222,65 @@ def welding_kafka_topic_health_dag():
                     text=True,
                     timeout=30,
                 )
-                lines = result.stdout.strip().split("\n")
+                if result.returncode != 0:
+                    raise RuntimeError(result.stderr.strip() or "kafka-consumer-groups failed")
+                lines = [
+                    line.strip()
+                    for line in result.stdout.strip().split("\n")
+                    if line.strip() and not line.startswith("GROUP")
+                ]
                 total_lag = 0
                 max_lag = 0
                 partition_count = 0
+                unassigned_partitions = 0
+                parse_errors = 0
 
                 for line in lines:
                     parts = line.split()
-                    # 출력 컬럼: GROUP TOPIC PARTITION CURRENT-OFFSET LOG-END-OFFSET LAG ...
-                    if len(parts) >= 6 and parts[5].lstrip("-").isdigit():
-                        lag_val = int(parts[5]) if parts[5] != "-" else 0
-                        total_lag += lag_val
-                        max_lag = max(max_lag, lag_val)
+                    # Expected columns:
+                    # GROUP TOPIC PARTITION CURRENT-OFFSET LOG-END-OFFSET LAG CONSUMER-ID HOST CLIENT-ID
+                    if len(parts) < 6:
+                        parse_errors += 1
+                        continue
+                    lag_token = parts[5]
+                    consumer_id = parts[6] if len(parts) >= 7 else "-"
+                    if lag_token == "-":
+                        unassigned_partitions += 1
                         partition_count += 1
+                        continue
+                    if not lag_token.lstrip("-").isdigit():
+                        parse_errors += 1
+                        continue
+                    lag_val = int(lag_token)
+                    if lag_val < 0:
+                        parse_errors += 1
+                        continue
+                    total_lag += lag_val
+                    max_lag = max(max_lag, lag_val)
+                    partition_count += 1
+                    if consumer_id == "-":
+                        unassigned_partitions += 1
+
+                if parse_errors > 0:
+                    status = "parse_error"
+                elif unassigned_partitions > 0:
+                    status = "unassigned"
+                elif max_lag > LAG_ALERT_THRESHOLD:
+                    status = "high_lag"
+                else:
+                    status = "normal"
 
                 lag_report[group] = {
                     "total_lag": total_lag,
                     "max_partition_lag": max_lag,
                     "partition_count": partition_count,
-                    "status": "high_lag" if max_lag > LAG_ALERT_THRESHOLD else "normal",
+                    "unassigned_partitions": unassigned_partitions,
+                    "parse_errors": parse_errors,
+                    "status": status,
                 }
                 log.info(
-                    "그룹 %s — total_lag: %d, max_partition_lag: %d",
-                    group, total_lag, max_lag,
+                    "그룹 %s — total_lag: %d, max_partition_lag: %d, unassigned: %d, parse_errors: %d",
+                    group, total_lag, max_lag, unassigned_partitions, parse_errors,
                 )
 
             except Exception as exc:
@@ -235,9 +295,9 @@ def welding_kafka_topic_health_dag():
         lag_report를 분석하여 경보 여부를 판단한다.
         하나라도 high_lag이면 alert 브랜치로.
         """
-        high_lag_groups = [
+        problematic_groups = [
             g for g, d in lag_report.items()
-            if d.get("status") == "high_lag"
+            if d.get("status") in {"high_lag", "unassigned", "parse_error", "unknown"}
         ]
 
         with psycopg2.connect(DB_CONN_STR) as conn:
@@ -250,15 +310,15 @@ def welding_kafka_topic_health_dag():
                         json.dumps(
                             {
                                 "lag_report": lag_report,
-                                "high_lag_groups": high_lag_groups,
+                                "problematic_groups": problematic_groups,
                                 "lag_threshold": LAG_ALERT_THRESHOLD,
                             }
                         ),
                     ),
                 )
 
-        if high_lag_groups:
-            log.warning("🚨 High Lag 감지: %s", high_lag_groups)
+        if problematic_groups:
+            log.warning("🚨 Kafka consumer 상태 이상 감지: %s", problematic_groups)
             return "alert_high_lag"
         return "log_kafka_healthy"
 
@@ -280,13 +340,13 @@ def welding_kafka_topic_health_dag():
     @task()
     def alert_high_lag(lag_report: dict):
         """Consumer Lag 경보 — DB에 상세 정보 기록."""
-        high_lag_groups = {
+        problem_groups = {
             g: d for g, d in lag_report.items()
-            if d.get("status") == "high_lag"
+            if d.get("status") in {"high_lag", "unassigned", "parse_error", "unknown"}
         }
         log.error(
-            "❌ Consumer Lag 임계값 초과! 그룹별 상세:\n%s",
-            json.dumps(high_lag_groups, indent=2),
+            "❌ Consumer 상태 이상 감지! 그룹별 상세:\n%s",
+            json.dumps(problem_groups, indent=2),
         )
         with psycopg2.connect(DB_CONN_STR) as conn:
             with conn.cursor() as cur:
@@ -298,13 +358,17 @@ def welding_kafka_topic_health_dag():
                         json.dumps(
                             {
                                 "status": "high_lag_alert",
-                                "high_lag_groups": high_lag_groups,
+                                "problem_groups": problem_groups,
                                 "threshold": LAG_ALERT_THRESHOLD,
                                 "action": "Check producer/consumer throughput balance",
                             }
                         ),
                     ),
                 )
+        _send_external_alert(
+            "welding_kafka_topic_health consumer issue detected",
+            {"status": "high_lag_alert", "problem_groups": problem_groups},
+        )
 
     # ── 의존성 연결 ──────────────────────────────────────────────
     topic_branch = check_topics_exist()
