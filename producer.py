@@ -18,7 +18,7 @@ python producer.py --dry-run
 강사님께 설명할 핵심 흐름
 ------------------------
 1. 실제 센서 API가 없으므로 CSV가 생산라인별로 10초마다 생성된다고 가정한다.
-2. data 폴더를 스캔해서 한 제품의 laser_b(MASKED_CH) / laser_a(MASKED_CH) CSV를 묶는다.
+2. data 폴더를 스캔해서 한 제품의 laser_a / laser_b CSV를 묶는다.
 3. 큰 신호 배열을 chunk 단위로 나눠 Kafka 메시지 크기를 안정적으로 유지한다.
 4. line_id + product_instance_id + lead + laser를 key로 사용해 같은 신호의 순서를 보장한다.
 5. --line-count로 생산라인을 늘려도 라인별 key가 분리되므로 Kafka가 병렬 처리할 수 있다.
@@ -107,20 +107,15 @@ PRODUCER_VERSION = "v1"
 FILE_RE = re.compile(
     r"(?P<date>\d{8})_(?P<time>\d{6})_(?P<seq>\d+)_"
     r"(?P<line>[A-Za-z0-9]+)_(?P<batch>\d{2})_(?P<product_id>[A-Za-z0-9_-]+)_"
-    r"(?P<lead_num>\d{2})_(?:(?:CH(?P<channel>[01]))|(?P<laser_id>L[AB]))\.csv$"
+    r"(?P<lead_num>\d{2})_(?P<laser_id>L[AB])\.csv$"
 )
 SIMPLE_FILE_RE = re.compile(
     r"(?P<date>\d{8})_battery_(?P<battery_id>\d+)_"
-    r"(?:(?:CH(?P<channel>[01]))|(?P<laser>laser_[ab]))\.csv$"
+    r"(?P<laser>laser_[ab])\.csv$"
 )
-# internal_mapping.md 기준: MASKED_CH은 laser_b/LB, MASKED_CH은 laser_a/LA이다.
 LASER_NAME_TO_CHANNEL = {"laser_b": 0, "laser_a": 1}
 LASER_ID_TO_CHANNEL = {"LB": 0, "LA": 1}
-# internal_mapping.md 기준:
-#   MASKED_CH = 반사광(Reflected) = LaserB = channel 0
-#   MASKED_CH = 출사광(Emitted)   = LaserA = channel 1
-# concat_out_0       : 출사광(LaserA) CSV 묶음 → channel 1
-# concat_reflected_1 : 반사광(LaserB) CSV 묶음 → channel 0
+# 익명 데이터셋 폴더명에 대한 채널 추론 규칙
 CHANNEL_FOLDER_TO_CHANNEL = {
     "concat_out_0": 1,
     "concat_reflected_1": 0,
@@ -130,7 +125,7 @@ CHANNEL_FOLDER_TO_CHANNEL = {
     "laser_a": 1,
 }
 DATE_RE = re.compile(r"^\d{8}$")
-TRAILING_CHANNEL_RE = re.compile(r"_(?:CH[01]|laser_[ab]|L[AB])$", re.IGNORECASE)
+TRAILING_CHANNEL_RE = re.compile(r"_(?:laser_[ab]|L[AB])$", re.IGNORECASE)
 TRAILING_DIGITS_RE = re.compile(r"(\d+)$")
 BATTERY_ID_RE = re.compile(r"battery_(\d+)", re.IGNORECASE)
 
@@ -300,11 +295,7 @@ def scan_data_dir(data_dir: str) -> list[ProductRecord]:
             parts = match.groupdict()
             instance_id = build_instance_id(parts)
             lead_num = int(parts["lead_num"])
-            channel = (
-                LASER_ID_TO_CHANNEL[parts["laser_id"]]
-                if parts.get("laser_id")
-                else int(parts["channel"])
-            )
+            channel = LASER_ID_TO_CHANNEL[parts["laser_id"]]
             if folder_channel is not None and folder_channel != channel:
                 channel_mismatch_count += 1
                 if channel_mismatch_logged < channel_mismatch_log_limit:
@@ -326,11 +317,7 @@ def scan_data_dir(data_dir: str) -> list[ProductRecord]:
             simple_match = SIMPLE_FILE_RE.match(csv_path.name)
             if simple_match:
                 parts = simple_match.groupdict()
-                channel = (
-                    LASER_NAME_TO_CHANNEL[parts["laser"].lower()]
-                    if parts.get("laser")
-                    else int(parts["channel"])
-                )
+                channel = LASER_NAME_TO_CHANNEL[parts["laser"].lower()]
                 if folder_channel is not None and folder_channel != channel:
                     channel_mismatch_count += 1
                     if channel_mismatch_logged < channel_mismatch_log_limit:
@@ -1004,4 +991,3 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
 
 if __name__ == "__main__":
     sys.exit(run(parse_args()))
-

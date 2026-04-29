@@ -133,17 +133,12 @@ def _product_id_from_name(stem: str) -> str:
 def _channel_from_path(path: Path) -> int:
     """Infer channel from folder name or filename tokens.
 
-    internal_mapping.md 기준:
-      MASKED_CH = 반사광(Reflected) = LaserB = channel 0
-      MASKED_CH = 입사광(Emitted)   = LaserA = channel 1
-    실제 데이터 폴더 매핑:
-      concat_reflected_1/ → LaserB → channel 0
-      concat_out_0/       → LaserA  → channel 1
+    공개 데이터셋의 익명 채널 토큰으로 채널을 구분한다.
     """
     text = "/".join(part.lower() for part in path.parts)
-    if any(token in text for token in ("concat_reflected", "MASKED_CH", "laser_b", "/reflect/", "_lb")):
+    if any(token in text for token in ("concat_reflected", "laser_b", "/reflect/", "_lb")):
         return 0
-    if any(token in text for token in ("concat_out", "MASKED_CH", "laser_a", "/out/", "_la")):
+    if any(token in text for token in ("concat_out", "laser_a", "/out/", "_la")):
         return 1
     return 0
 
@@ -875,4 +870,3 @@ def run(args: argparse.Namespace) -> int:
 
 if __name__ == "__main__":
     sys.exit(run(parse_args()))
-

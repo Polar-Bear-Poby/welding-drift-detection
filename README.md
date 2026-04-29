@@ -150,12 +150,10 @@ Postgres:  postgres:5432
 
 ```text
 {date}_battery_{battery_id}_laser_{a|b}.csv
-{date}_battery_{battery_id}_CH{channel}.csv
-{date}_battery_{battery_id}_laser_{a|b}.csv
 ```
 
-채널 매핑은 `internal_mapping.md` 기준을 따릅니다. `laser_a`/`MASKED_CH`은 `LA` 및 channel 1, `laser_b`/`MASKED_CH`은 `LB` 및 channel 0으로 처리됩니다.
-새 저장소 구조에서는 `out`이 `MASKED_CH/LA/laser_a`, `reflect`가 `MASKED_CH/LB/laser_b`로 처리됩니다.
+채널 구분은 공개된 익명 토큰(`laser_a`, `laser_b`)만 사용합니다.
+저장소 구조에서도 원본 채널 코드 대신 익명 채널명만 사용합니다.
 
 ### 4. Producer dry run
 
@@ -267,7 +265,7 @@ uv run python -m unittest discover -s tests -p test_kafka_integration.py -v
 
 통과 기준:
 
-- `laser_b`는 `MASKED_CH/LB/LaserB`, `laser_a`는 `MASKED_CH/LA/LaserA`로 매핑된다.
+- `laser_a`, `laser_b` 채널이 모두 수집/처리된다.
 - 같은 제품의 `laser_b`, `laser_a` CSV가 하나의 product instance로 묶인다.
 - 생산라인을 늘리면 `LINE_01`, `LINE_02`처럼 라인별 이벤트가 생성되고, 같은 라인은 10초 간격을 유지한다.
 - CSV 신호는 chunk로 나뉘며, partition key에는 `line_id + product_instance_id + lead + laser`가 들어간다.
@@ -371,4 +369,3 @@ git push -u origin main
 - [x] Topic 이름, 개수, 역할
 - [x] Partitioning 전략과 key 선택 이유
 - [x] Configuration 설정
-
