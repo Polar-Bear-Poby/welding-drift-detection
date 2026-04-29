@@ -35,7 +35,7 @@ _PG_HOST = os.getenv("POSTGRES_HOST", "postgres")
 _PG_PORT = os.getenv("POSTGRES_PORT", "5432")
 _PG_DB   = os.getenv("POSTGRES_DB",   "welding_drift")
 _PG_USER = os.getenv("POSTGRES_USER", "welding")
-_PG_PASS = os.getenv("POSTGRES_PASSWORD", "welding_pass")
+_PG_PASS = os.getenv("POSTGRES_PASSWORD", "")
 DB_CONN_STR = f"host={_PG_HOST} port={_PG_PORT} dbname={_PG_DB} user={_PG_USER} password={_PG_PASS}"
 
 # 최소 기대 행 수 (라인 3개 × 채널 2개 = 6개 이상이면 정상)
@@ -201,3 +201,5 @@ def welding_data_availability_check_dag():
 
 
 welding_data_availability_check_dag()
+
+

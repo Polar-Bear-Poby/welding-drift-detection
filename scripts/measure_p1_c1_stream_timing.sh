@@ -25,7 +25,11 @@ POSTGRES_CONTAINER="${POSTGRES_CONTAINER:-welding-postgres}"
 
 POSTGRES_DB="${POSTGRES_DB:-welding_drift}"
 POSTGRES_USER="${POSTGRES_USER:-welding}"
-POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-welding_pass}"
+POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-}"
+if [[ -z "${POSTGRES_PASSWORD}" ]]; then
+  echo "ERROR: POSTGRES_PASSWORD must be set" >&2
+  exit 1
+fi
 
 RUN_TS="${RUN_TS:-$(date +%Y%m%d_%H%M%S)}"
 RUN_TAG="${RUN_TAG:-nline_even_${RUN_TS}}"
@@ -415,3 +419,4 @@ printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
 log "Benchmark summary saved: ${SUMMARY_TXT}"
 log "History updated: ${SUMMARY_CSV}"
 log "Result: producer_duration=${producer_duration_sec}s db_rows=${db_count}/${EXPECTED_ROWS} time_to_first_db_sec=${time_to_first_db_sec} end_to_last_db_sec=${end_to_last_db_sec} drain_after_producer_sec=${db_drain_after_producer_sec}"
+

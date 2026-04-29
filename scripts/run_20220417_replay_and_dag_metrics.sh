@@ -62,7 +62,11 @@ POSTGRES_CONTAINER="${POSTGRES_CONTAINER:-welding-postgres}"
 
 POSTGRES_DB="${POSTGRES_DB:-welding_drift}"
 POSTGRES_USER="${POSTGRES_USER:-welding}"
-POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-welding_pass}"
+POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-}"
+if [[ -z "${POSTGRES_PASSWORD}" ]]; then
+  echo "ERROR: POSTGRES_PASSWORD must be set" >&2
+  exit 1
+fi
 
 HOST_DATA_DIR="${HOST_DATA_DIR:-${ROOT_DIR}/data}"
 HOST_STORAGE_DIR="${HOST_STORAGE_DIR:-${ROOT_DIR}/storage}"
@@ -280,3 +284,4 @@ if [[ "${DOWN_AFTER_RUN}" == "1" ]]; then
   log "DOWN_AFTER_RUN=1 -> stopping Airflow and all project containers."
   docker compose down --remove-orphans >/dev/null 2>&1 || true
 fi
+

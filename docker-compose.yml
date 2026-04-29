@@ -8,7 +8,7 @@ x-airflow-common: &airflow-common
     &airflow-common-env
     AIRFLOW__CORE__EXECUTOR: LocalExecutor
     # PIP requirements are now in Dockerfile.airflow
-    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-welding}:${POSTGRES_PASSWORD:-welding_pass}@postgres:5432/${POSTGRES_DB:-welding_drift}
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-welding}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-welding_drift}
     AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:-}
     AIRFLOW__CORE__LOAD_EXAMPLES: "false"
     AIRFLOW__FAB__AUTH_ROLE_PUBLIC: "Admin"
@@ -17,7 +17,7 @@ x-airflow-common: &airflow-common
     AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
     AIRFLOW_CONN_KAFKA_DEFAULT: kafka://kafka:9092
     AIRFLOW_CONN_SPARK_DEFAULT: spark://spark-master:7077
-    AIRFLOW_CONN_WELDING_POSTGRES: postgresql://${POSTGRES_USER:-welding}:${POSTGRES_PASSWORD:-welding_pass}@postgres:5432/${POSTGRES_DB:-welding_drift}
+    AIRFLOW_CONN_WELDING_POSTGRES: postgresql://${POSTGRES_USER:-welding}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-welding_drift}
     # Airflow 3 Auth Manager explicit setting
     AIRFLOW__CORE__AUTH_MANAGER: "airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager"
     DOCKER_HOST: unix:///var/run/docker.sock
@@ -164,7 +164,7 @@ services:
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-welding_drift}
       POSTGRES_USER: ${POSTGRES_USER:-welding}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-welding_pass}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     volumes:
       - postgres-data:/var/lib/postgresql/data
       - ./db/init:/docker-entrypoint-initdb.d:ro
@@ -336,3 +336,5 @@ volumes:
 networks:
   welding-net:
     driver: bridge
+
+

@@ -43,7 +43,7 @@ _PG_HOST    = os.getenv("POSTGRES_HOST",     "postgres")
 _PG_PORT    = os.getenv("POSTGRES_PORT",     "5432")
 _PG_DB      = os.getenv("POSTGRES_DB",       "welding_drift")
 _PG_USER    = os.getenv("POSTGRES_USER",     "welding")
-_PG_PASS    = os.getenv("POSTGRES_PASSWORD", "welding_pass")
+_PG_PASS    = os.getenv("POSTGRES_PASSWORD", "")
 DB_CONN_STR = f"host={_PG_HOST} port={_PG_PORT} dbname={_PG_DB} user={_PG_USER} password={_PG_PASS}"
 
 # [fix #7] 컨테이너 내부 경로: docker-compose.yml 기준 마운트 경로
@@ -356,3 +356,5 @@ def welding_batch_backfill_dag():
 
 
 welding_batch_backfill_dag()
+
+

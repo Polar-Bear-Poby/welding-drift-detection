@@ -743,7 +743,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--postgres-port", type=int, default=int(os.getenv("POSTGRES_PORT", "15432")))
     parser.add_argument("--postgres-db", default=os.getenv("POSTGRES_DB", "welding_drift"))
     parser.add_argument("--postgres-user", default=os.getenv("POSTGRES_USER", "welding"))
-    parser.add_argument("--postgres-password", default=os.getenv("POSTGRES_PASSWORD", "welding_pass"))
+    parser.add_argument("--postgres-password", default=os.getenv("POSTGRES_PASSWORD", ""))
     return parser.parse_args(argv)
 
 
@@ -870,3 +870,5 @@ def run(args: argparse.Namespace) -> int:
 
 if __name__ == "__main__":
     sys.exit(run(parse_args()))
+
+

@@ -23,7 +23,11 @@ POSTGRES_CONTAINER="${POSTGRES_CONTAINER:-welding-postgres}"
 
 POSTGRES_DB="${POSTGRES_DB:-welding_drift}"
 POSTGRES_USER="${POSTGRES_USER:-welding}"
-POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-welding_pass}"
+POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-}"
+if [[ -z "${POSTGRES_PASSWORD}" ]]; then
+  echo "ERROR: POSTGRES_PASSWORD must be set" >&2
+  exit 1
+fi
 
 DAG_IDS="${DAG_IDS:-welding_batch_ingest,welding_daily_quality_report,welding_streaming_monitor}"
 DAG_LOOKBACK_DAYS="${DAG_LOOKBACK_DAYS:-30}"
@@ -307,3 +311,4 @@ while [[ "${STOP_REQUESTED}" -eq 0 ]]; do
 done
 
 log "Always-on daemon stopped."
+

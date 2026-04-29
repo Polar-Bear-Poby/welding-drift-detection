@@ -99,11 +99,11 @@ Airflow UI:
 http://localhost:18088
 ```
 
-기본 계정(로컬 데모용):
+초기 계정은 `.env`의 `AIRFLOW_ADMIN_USER`, `AIRFLOW_ADMIN_PASSWORD` 값을 사용합니다.
 
 ```text
-username: admin
-password: admin
+username: <AIRFLOW_ADMIN_USER>
+password: <AIRFLOW_ADMIN_PASSWORD>
 ```
 
 Kafka UI:

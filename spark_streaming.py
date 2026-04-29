@@ -45,7 +45,7 @@ LINE_FILTER_RAW = os.getenv("LINE_FILTER", "").strip()
 LINE_FILTERS = [token.strip() for token in LINE_FILTER_RAW.split(",") if token.strip()]
 POSTGRES_URL = f"jdbc:postgresql://{os.getenv('POSTGRES_HOST', 'postgres')}:{os.getenv('POSTGRES_PORT', '5432')}/{os.getenv('POSTGRES_DB', 'welding_drift')}?stringtype=unspecified"
 POSTGRES_USER = os.getenv("POSTGRES_USER", "welding")
-POSTGRES_PASS = os.getenv("POSTGRES_PASSWORD", "welding_pass")
+POSTGRES_PASS = os.getenv("POSTGRES_PASSWORD", "")
 LASER_A_MODEL_NAME = os.getenv("LASER_A_MODEL_NAME", "laser_a_placeholder_model")
 LASER_B_MODEL_NAME = os.getenv("LASER_B_MODEL_NAME", "laser_b_placeholder_model")
 
@@ -363,3 +363,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
