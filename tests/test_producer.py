@@ -74,6 +74,26 @@ class ProducerUnitTests(unittest.TestCase):
             self.assertEqual(record.files[0][1].parts[-2:], ("reflect", "battery_10.csv"))
             self.assertEqual(record.files[1][1].parts[-2:], ("out", "battery_10.csv"))
 
+    def test_scan_prefers_filename_channel_when_folder_mismatch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_signal(
+                root / "laser_a" / "20220417_battery_10_laser_b.csv",
+                [0.1, 0.2],
+            )
+            write_signal(
+                root / "laser_b" / "20220417_battery_10_laser_a.csv",
+                [0.3, 0.4],
+            )
+
+            records = producer.scan_data_dir(str(root))
+
+            self.assertEqual(len(records), 1)
+            record = records[0]
+            # File name channel should win over folder channel.
+            self.assertEqual(record.files[0][1].name, "20220417_battery_10_laser_b.csv")
+            self.assertEqual(record.files[1][1].name, "20220417_battery_10_laser_a.csv")
+
     def test_publish_items_simulate_multiple_lines_every_10_seconds(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -223,6 +243,55 @@ class ProducerUnitTests(unittest.TestCase):
             self.assertIn("test.topic.laser_a", topics)
             self.assertIn("test.topic.laser_b", topics)
             self.assertNotIn("test.topic.fallback", topics)
+
+    def test_publish_product_skips_when_pair_missing_by_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_signal(root / "20220417_battery_10_laser_b.csv", [0.1, 0.2, 0.3, 0.4])
+
+            record = producer.scan_data_dir(str(root))[0]
+            item = producer.make_publish_items([record], 0, 1, 1, 10)[0]
+            fake_producer = FakeProducer()
+
+            sent_count = producer.publish_product(
+                producer=fake_producer,
+                item=item,
+                topic="test.topic",
+                topic_laser_a=None,
+                topic_laser_b=None,
+                chunk_size=3,
+                target_chunk_bytes=80,
+                speed=0,
+            )
+            self.assertEqual(sent_count, 0)
+            self.assertEqual(len(fake_producer.sent), 0)
+
+            sent_count_allow = producer.publish_product(
+                producer=fake_producer,
+                item=item,
+                topic="test.topic",
+                topic_laser_a=None,
+                topic_laser_b=None,
+                chunk_size=3,
+                target_chunk_bytes=80,
+                speed=0,
+                require_channel_pair=False,
+            )
+            self.assertGreater(sent_count_allow, 0)
+
+    def test_channel_pair_alignment_detects_battery_mismatch(self):
+        record = producer.ProductRecord(
+            product_instance_id="20220417_battery_x",
+            product_id="battery_x",
+            line_id="LINE_01",
+            batch_id="20220417",
+            sequence_id="1",
+            event_time=producer.parse_event_time("20220417", "000000"),
+        )
+        record.add_file(1, 0, Path("20220417_battery_130_laser_b.csv"))
+        record.add_file(1, 1, Path("20220417_battery_50_laser_a.csv"))
+
+        self.assertFalse(producer.is_channel_pair_aligned(record))
 
 
 if __name__ == "__main__":

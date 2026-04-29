@@ -16,6 +16,9 @@ TOPIC_RAW_LASER_A="${TOPIC_RAW_LASER_A:-welding.raw.laser_a.v1}"
 TOPIC_RAW_LASER_B="${TOPIC_RAW_LASER_B:-welding.raw.laser_b.v1}"
 LINE_COUNT="${LINE_COUNT:-3}"
 CONSUMER_COUNT="${CONSUMER_COUNT:-$((LINE_COUNT * 2))}"
+SPARK_STREAMING_CORES_MAX="${SPARK_STREAMING_CORES_MAX:-1}"
+SPARK_STREAMING_EXECUTOR_CORES="${SPARK_STREAMING_EXECUTOR_CORES:-1}"
+SPARK_STREAMING_EXECUTOR_MEMORY="${SPARK_STREAMING_EXECUTOR_MEMORY:-1g}"
 
 mkdir -p "${STATE_DIR}"
 
@@ -110,13 +113,16 @@ docker exec "${SPARK_MASTER_CONTAINER}" bash -lc \
        group_id='welding-stream-laser-b';
      fi;
      rm -rf \"/tmp/spark-checkpoints-consumer-\${consumer_id}\";
-     nohup env TOPIC_RAW=\"\${topic}\" CHANNEL_FILTER=\"\${channel}\" KAFKA_GROUP_ID=\"\${group_id}\" SPARK_CHECKPOINT_DIR=\"/tmp/spark-checkpoints-consumer-\${consumer_id}\" \
-       /opt/spark/bin/spark-submit \
-       --master spark://spark-master:7077 \
-       --conf spark.jars.ivy=/tmp/.ivy2 \
-       --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1,org.postgresql:postgresql:42.7.3 \
-       /opt/spark/apps/spark_streaming.py \
-       >\"/tmp/spark_streaming_consumer_\${consumer_id}.log\" 2>&1 &
+      nohup env TOPIC_RAW=\"\${topic}\" CHANNEL_FILTER=\"\${channel}\" KAFKA_GROUP_ID=\"\${group_id}\" SPARK_CHECKPOINT_DIR=\"/tmp/spark-checkpoints-consumer-\${consumer_id}\" \
+        /opt/spark/bin/spark-submit \
+        --master spark://spark-master:7077 \
+        --conf spark.cores.max=${SPARK_STREAMING_CORES_MAX} \
+        --conf spark.executor.cores=${SPARK_STREAMING_EXECUTOR_CORES} \
+        --conf spark.executor.memory=${SPARK_STREAMING_EXECUTOR_MEMORY} \
+        --conf spark.jars.ivy=/tmp/.ivy2 \
+        --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1,org.postgresql:postgresql:42.7.3 \
+        /opt/spark/apps/spark_streaming.py \
+        >\"/tmp/spark_streaming_consumer_\${consumer_id}.log\" 2>&1 &
    done;
    echo 'spark_streaming.py consumers started';"
 

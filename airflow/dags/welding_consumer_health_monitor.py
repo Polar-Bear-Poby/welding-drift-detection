@@ -8,10 +8,11 @@ welding_consumer_health_monitor.py - Airflow 3 Version (수정)
             Airflow 컨테이너에서 docker exec로 spark 소비자만 직접 재기동.
   - [fix #5] 총 프로세스 수 wc -l → kafka-consumer-groups --describe 기반
             laser_a 그룹 3개 / laser_b 그룹 3개를 개별 검증
+  - [fix #8] CONSUMER_COUNT/EXPECTED_* 환경변수 기반으로 기대 컨슈머 수 동적화
 
 채널 규칙:
-  - 홀수 consumer_id (1,3,5) → welding-stream-laser-a 그룹
-  - 짝수 consumer_id (2,4,6) → welding-stream-laser-b 그룹
+  - 홀수 consumer_id → welding-stream-laser-a 그룹
+  - 짝수 consumer_id → welding-stream-laser-b 그룹
 """
 
 from __future__ import annotations
@@ -40,8 +41,23 @@ KAFKA_CONTAINER  = "welding-kafka"
 KAFKA_BOOTSTRAP  = "kafka:9092"
 
 # 채널별 기대 컨슈머 그룹 멤버 수
-EXPECTED_LASER_A = 3  # 홀수 consumer_id: 1, 3, 5
-EXPECTED_LASER_B = 3  # 짝수 consumer_id: 2, 4, 6
+_REQUESTED_CONSUMER_COUNT = int(os.getenv("CONSUMER_COUNT", "6"))
+if _REQUESTED_CONSUMER_COUNT < 2:
+    TARGET_CONSUMER_COUNT = 2
+elif _REQUESTED_CONSUMER_COUNT % 2 != 0:
+    TARGET_CONSUMER_COUNT = _REQUESTED_CONSUMER_COUNT + 1
+else:
+    TARGET_CONSUMER_COUNT = _REQUESTED_CONSUMER_COUNT
+
+if TARGET_CONSUMER_COUNT != _REQUESTED_CONSUMER_COUNT:
+    log.warning(
+        "CONSUMER_COUNT adjusted for odd/even rule: requested=%s adjusted=%s",
+        _REQUESTED_CONSUMER_COUNT,
+        TARGET_CONSUMER_COUNT,
+    )
+DEFAULT_EXPECTED_PER_CHANNEL = max(1, TARGET_CONSUMER_COUNT // 2)
+EXPECTED_LASER_A = int(os.getenv("EXPECTED_LASER_A", str(DEFAULT_EXPECTED_PER_CHANNEL)))
+EXPECTED_LASER_B = int(os.getenv("EXPECTED_LASER_B", str(DEFAULT_EXPECTED_PER_CHANNEL)))
 CONSUMER_GROUPS  = {
     "welding-stream-laser-a": EXPECTED_LASER_A,
     "welding-stream-laser-b": EXPECTED_LASER_B,
@@ -50,7 +66,10 @@ CONSUMER_GROUPS  = {
 # [fix #2] 재기동: Airflow 컨테이너에서 spark 컨테이너 내부 프로세스를 직접 재기동
 RESTART_CMD = (
     "docker exec welding-spark-master bash -lc '"
-    "CONSUMER_COUNT=6; "
+    f"CONSUMER_COUNT={TARGET_CONSUMER_COUNT}; "
+    "SPARK_STREAMING_CORES_MAX=${SPARK_STREAMING_CORES_MAX:-1}; "
+    "SPARK_STREAMING_EXECUTOR_CORES=${SPARK_STREAMING_EXECUTOR_CORES:-1}; "
+    "SPARK_STREAMING_EXECUTOR_MEMORY=${SPARK_STREAMING_EXECUTOR_MEMORY:-1g}; "
     "pids=$(pgrep -f \"spark_streaming.py\" 2>/dev/null | grep -vw \"$$\" || true); "
     "if [ -n \"$pids\" ]; then kill -TERM $pids || true; sleep 5; fi; "
     "pids2=$(pgrep -f \"spark_streaming.py\" 2>/dev/null | grep -vw \"$$\" || true); "
@@ -65,7 +84,11 @@ RESTART_CMD = (
     "  rm -rf /tmp/spark-checkpoints-consumer-${consumer_id}; "
     "  nohup env TOPIC_RAW=\"${topic}\" CHANNEL_FILTER=\"${channel}\" "
     "    KAFKA_GROUP_ID=\"${group_id}\" SPARK_CHECKPOINT_DIR=\"/tmp/spark-checkpoints-consumer-${consumer_id}\" "
-    "    /opt/spark/bin/spark-submit --master spark://spark-master:7077 --conf spark.jars.ivy=/tmp/.ivy2 "
+    "    /opt/spark/bin/spark-submit --master spark://spark-master:7077 "
+    "    --conf spark.cores.max=${SPARK_STREAMING_CORES_MAX} "
+    "    --conf spark.executor.cores=${SPARK_STREAMING_EXECUTOR_CORES} "
+    "    --conf spark.executor.memory=${SPARK_STREAMING_EXECUTOR_MEMORY} "
+    "    --conf spark.jars.ivy=/tmp/.ivy2 "
     "    --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1,org.postgresql:postgresql:42.7.3 "
     "    /opt/spark/apps/spark_streaming.py >/tmp/spark_streaming_consumer_${consumer_id}.log 2>&1 & "
     "done;'"
@@ -114,7 +137,7 @@ def _get_group_member_count(group_id: str) -> int:
 
 **검증 방식 (v2)**
 - `kafka-consumer-groups --describe`로 그룹별 활성 CONSUMER-ID 개수를 산출
-- `welding-stream-laser-a` → 3개, `welding-stream-laser-b` → 3개 각각 검증
+- `welding-stream-laser-a` / `welding-stream-laser-b` 기대값은 환경변수 기반으로 검증
 
 **재기동 경로 (fix #2)**
 - Airflow 컨테이너에서 `docker exec welding-spark-master ...`로 소비자 프로세스만 직접 재기동

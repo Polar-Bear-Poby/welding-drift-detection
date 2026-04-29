@@ -6,13 +6,10 @@ performs pattern splitting, and stores the results in PostgreSQL.
 """
 
 import os
-import math
 import logging
-import json
 import uuid
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, List
+from typing import List
 
 from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql import functions as F
@@ -49,6 +46,8 @@ LINE_FILTERS = [token.strip() for token in LINE_FILTER_RAW.split(",") if token.s
 POSTGRES_URL = f"jdbc:postgresql://{os.getenv('POSTGRES_HOST', 'postgres')}:{os.getenv('POSTGRES_PORT', '5432')}/{os.getenv('POSTGRES_DB', 'welding_drift')}?stringtype=unspecified"
 POSTGRES_USER = os.getenv("POSTGRES_USER", "welding")
 POSTGRES_PASS = os.getenv("POSTGRES_PASSWORD", "welding_pass")
+LASER_A_MODEL_NAME = os.getenv("LASER_A_MODEL_NAME", "laser_a_placeholder_model")
+LASER_B_MODEL_NAME = os.getenv("LASER_B_MODEL_NAME", "laser_b_placeholder_model")
 
 # --- JSON Schema for Kafka Messages ---
 # Based on producer.py message format
@@ -121,14 +120,43 @@ def split_patterns_and_score(signal: List[float], pattern_count: int = 16) -> di
     
     return {"cpd_score": float(cpd_score), "decision": decision}
 
+
+def analyze_laser_a(signal: List[float]) -> dict:
+    """
+    Placeholder route for Laser A model inference.
+    TODO: replace proxy with real Laser A drift model inference.
+    """
+    result = split_patterns_and_score(signal)
+    result["model_name"] = LASER_A_MODEL_NAME
+    return result
+
+
+def analyze_laser_b(signal: List[float]) -> dict:
+    """
+    Placeholder route for Laser B model inference.
+    TODO: replace proxy with real Laser B drift model inference.
+    """
+    result = split_patterns_and_score(signal)
+    result["model_name"] = LASER_B_MODEL_NAME
+    return result
+
+
+def analyze_by_channel(channel: int, signal: List[float]) -> dict:
+    if channel == 1:
+        return analyze_laser_a(signal)
+    if channel == 0:
+        return analyze_laser_b(signal)
+    return {"cpd_score": 0.0, "decision": "PASS", "model_name": "unknown_channel"}
+
 # UDF wrapper for the analysis logic
 @F.udf(returnType=T.StructType([
     T.StructField("cpd_score", T.DoubleType(), False),
-    T.StructField("decision", T.StringType(), False)
+    T.StructField("decision", T.StringType(), False),
+    T.StructField("model_name", T.StringType(), False),
 ]))
-def analyze_signal_udf(signal_list: List[float]):
+def analyze_signal_udf(channel: int, signal_list: List[float]):
     # signal_list here is a flattened and chunk-index-sorted full signal array.
-    return split_patterns_and_score(signal_list)
+    return analyze_by_channel(channel, signal_list)
 
 @F.udf(returnType=T.StringType())
 def generate_uuid_udf():
@@ -176,7 +204,14 @@ def process_batch(batch_df: DataFrame, batch_id: int):
         .save()
     
     # Also show in console for monitoring
-    batch_df.select("window.start", "product_id", "channel", "analysis.cpd_score", "analysis.decision").show(truncate=False)
+    batch_df.select(
+        "window.start",
+        "product_id",
+        "channel",
+        "analysis.model_name",
+        "analysis.cpd_score",
+        "analysis.decision",
+    ).show(truncate=False)
 
 def main():
     if LINE_SLOT_COUNT < 1:
@@ -313,7 +348,7 @@ def main():
     
     # 4. Analyze Signal
     analyzed_stream = final_signal_stream.withColumn(
-        "analysis", analyze_signal_udf(F.col("full_signal"))
+        "analysis", analyze_signal_udf(F.col("channel"), F.col("full_signal"))
     )
     
     # 5. Sink to PostgreSQL and Console

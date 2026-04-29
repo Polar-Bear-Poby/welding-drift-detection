@@ -35,6 +35,7 @@ import re
 import sys
 import time
 import hashlib
+import math
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -131,6 +132,7 @@ CHANNEL_FOLDER_TO_CHANNEL = {
 DATE_RE = re.compile(r"^\d{8}$")
 TRAILING_CHANNEL_RE = re.compile(r"_(?:CH[01]|laser_[ab]|L[AB])$", re.IGNORECASE)
 TRAILING_DIGITS_RE = re.compile(r"(\d+)$")
+BATTERY_ID_RE = re.compile(r"battery_(\d+)", re.IGNORECASE)
 
 
 def parse_event_time(date_text: str, time_text: str) -> datetime:
@@ -234,6 +236,50 @@ def line_number_from_line_id(line_id: str) -> int:
     return 1
 
 
+def extract_battery_id(path: Path | None) -> str | None:
+    if path is None:
+        return None
+    matched = BATTERY_ID_RE.search(path.name)
+    if not matched:
+        return None
+    return str(int(matched.group(1)))
+
+
+def paired_leads(record: ProductRecord) -> list[int]:
+    return sorted(set(record.files[0].keys()) & set(record.files[1].keys()))
+
+
+def has_channel_pair(record: ProductRecord) -> bool:
+    return len(paired_leads(record)) > 0
+
+
+def is_channel_pair_aligned(record: ProductRecord) -> bool:
+    """
+    Validate Laser A/B pairing consistency for the same lead.
+
+    If both file names carry `battery_<id>`, the ids must match.
+    When battery id cannot be inferred from one side, the pair is treated as unknown
+    (and accepted) to avoid false negatives for non-battery naming conventions.
+    """
+    for lead_num in paired_leads(record):
+        file_b = record.files[0].get(lead_num)
+        file_a = record.files[1].get(lead_num)
+        battery_b = extract_battery_id(file_b)
+        battery_a = extract_battery_id(file_a)
+        if battery_b is not None and battery_a is not None and battery_b != battery_a:
+            logger.error(
+                "Channel pair mismatch. product=%s lead=%s battery_b=%s file_b=%s battery_a=%s file_a=%s",
+                record.product_instance_id,
+                lead_num,
+                battery_b,
+                file_b,
+                battery_a,
+                file_a,
+            )
+            return False
+    return True
+
+
 def scan_data_dir(data_dir: str) -> list[ProductRecord]:
     """Scan CSV files and group them into line/product instances."""
     root = Path(data_dir)
@@ -242,6 +288,9 @@ def scan_data_dir(data_dir: str) -> list[ProductRecord]:
 
     records: dict[str, ProductRecord] = {}
     ignored = 0
+    channel_mismatch_count = 0
+    channel_mismatch_logged = 0
+    channel_mismatch_log_limit = 20
 
     for csv_path in sorted(root.glob("**/*.csv")):
         # 1순위: 제출 문서의 정식 파일명 규칙을 파싱한다.
@@ -256,8 +305,16 @@ def scan_data_dir(data_dir: str) -> list[ProductRecord]:
                 if parts.get("laser_id")
                 else int(parts["channel"])
             )
-            if folder_channel is not None:
-                channel = folder_channel
+            if folder_channel is not None and folder_channel != channel:
+                channel_mismatch_count += 1
+                if channel_mismatch_logged < channel_mismatch_log_limit:
+                    logger.warning(
+                        "Channel mismatch between file name and folder. file=%s name_channel=%s folder_channel=%s (using file name)",
+                        csv_path,
+                        channel,
+                        folder_channel,
+                    )
+                    channel_mismatch_logged += 1
             product_id = parts["product_id"]
             line_id = parts["line"]
             batch_id = parts["batch"]
@@ -274,8 +331,16 @@ def scan_data_dir(data_dir: str) -> list[ProductRecord]:
                     if parts.get("laser")
                     else int(parts["channel"])
                 )
-                if folder_channel is not None:
-                    channel = folder_channel
+                if folder_channel is not None and folder_channel != channel:
+                    channel_mismatch_count += 1
+                    if channel_mismatch_logged < channel_mismatch_log_limit:
+                        logger.warning(
+                            "Channel mismatch between file name and folder. file=%s name_channel=%s folder_channel=%s (using file name)",
+                            csv_path,
+                            channel,
+                            folder_channel,
+                        )
+                        channel_mismatch_logged += 1
 
                 lead_num = 1
                 product_id = f"battery_{int(parts['battery_id'])}"
@@ -318,11 +383,12 @@ def scan_data_dir(data_dir: str) -> list[ProductRecord]:
 
     result = sorted(records.values(), key=lambda r: (r.event_time, r.line_id, r.product_instance_id))
     logger.info(
-        "Scanned %s product instances from %s. complete=%s ignored_files=%s",
+        "Scanned %s product instances from %s. complete=%s ignored_files=%s channel_mismatch=%s",
         len(result),
         data_dir,
         sum(1 for r in result if r.is_complete),
         ignored,
+        channel_mismatch_count,
     )
     return result
 
@@ -600,6 +666,7 @@ def publish_product(
     chunk_size: int,
     target_chunk_bytes: int | None,
     speed: float,
+    require_channel_pair: bool = True,
 ) -> int:
     """Publish all available leads/channels for one product instance."""
     sent = 0
@@ -609,7 +676,15 @@ def publish_product(
         1: topic_laser_a or topic,
     }
 
-    for lead_num in sorted(record.leads_present):
+    leads_to_publish = paired_leads(record) if require_channel_pair else sorted(record.leads_present)
+    if require_channel_pair and not leads_to_publish:
+        logger.warning(
+            "Skip product without paired channels. product=%s",
+            item.product_instance_id,
+        )
+        return 0
+
+    for lead_num in leads_to_publish:
         # 한 제품 안에서 laser_b(channel 0), laser_a(channel 1)를 순서대로 발행한다.
         for channel in (0, 1):
             file_path = record.files[channel].get(lead_num)
@@ -687,6 +762,20 @@ def run(args: argparse.Namespace) -> int:
         records = [record for record in records if record.is_complete]
         logger.info("Filtered to complete product instances: %s", len(records))
 
+    if args.require_channel_pair:
+        before = len(records)
+        records = [
+            record
+            for record in records
+            if has_channel_pair(record) and is_channel_pair_aligned(record)
+        ]
+        filtered = before - len(records)
+        logger.info(
+            "Paired-channel guard enabled. kept=%s filtered=%s",
+            len(records),
+            filtered,
+        )
+
     # --oldest-date-only: 가장 오래된 event_date의 제품만 선택한다.
     if args.oldest_date_only and records:
         oldest_date = min(r.event_time.date() for r in records)
@@ -762,6 +851,7 @@ def run(args: argparse.Namespace) -> int:
                     chunk_size=args.chunk_size,
                     target_chunk_bytes=args.target_chunk_bytes,
                     speed=args.speed,
+                    require_channel_pair=args.require_channel_pair,
                 )
                 pub_elapsed = time.monotonic() - pub_start
                 total_messages += sent
@@ -894,6 +984,20 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         "--line-seed",
         default=None,
         help="Comma-separated random seeds for per-line shuffle, e.g. '1,2,3'",
+    )
+    pair_group = parser.add_mutually_exclusive_group()
+    pair_group.add_argument(
+        "--require-channel-pair",
+        dest="require_channel_pair",
+        action="store_true",
+        default=True,
+        help="Publish only leads where LaserA/LaserB pair exists and battery ids match.",
+    )
+    pair_group.add_argument(
+        "--allow-single-channel",
+        dest="require_channel_pair",
+        action="store_false",
+        help="Allow publishing leads even when one channel is missing.",
     )
     return parser.parse_args(argv)
 

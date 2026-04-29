@@ -37,6 +37,9 @@ CONSUMER_START_WAIT_SEC="${CONSUMER_START_WAIT_SEC:-60}"
 POLL_INTERVAL_SEC="${POLL_INTERVAL_SEC:-5}"
 QUIET_WINDOW_SEC="${QUIET_WINDOW_SEC:-20}"
 MEASURE_TIMEOUT_SEC="${MEASURE_TIMEOUT_SEC:-900}"
+SPARK_STREAMING_CORES_MAX="${SPARK_STREAMING_CORES_MAX:-1}"
+SPARK_STREAMING_EXECUTOR_CORES="${SPARK_STREAMING_EXECUTOR_CORES:-1}"
+SPARK_STREAMING_EXECUTOR_MEMORY="${SPARK_STREAMING_EXECUTOR_MEMORY:-1g}"
 
 STOP_ALWAYS_ON_PRODUCER="${STOP_ALWAYS_ON_PRODUCER:-1}"
 RESTORE_ALWAYS_ON_PRODUCER="${RESTORE_ALWAYS_ON_PRODUCER:-1}"
@@ -150,6 +153,9 @@ start_streaming_consumer() {
      nohup env TOPIC_RAW='${topic_name}' SPARK_CHECKPOINT_DIR='${checkpoint_dir}' CHANNEL_FILTER='${channel_filter}' KAFKA_GROUP_ID='${kafka_group_id}' \
        /opt/spark/bin/spark-submit \
        --master spark://spark-master:7077 \
+       --conf spark.cores.max=${SPARK_STREAMING_CORES_MAX} \
+       --conf spark.executor.cores=${SPARK_STREAMING_EXECUTOR_CORES} \
+       --conf spark.executor.memory=${SPARK_STREAMING_EXECUTOR_MEMORY} \
        --conf spark.jars.ivy=/tmp/.ivy2 \
        --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1,org.postgresql:postgresql:42.7.3 \
        /opt/spark/apps/spark_streaming.py \
@@ -194,6 +200,9 @@ restore_default_streaming_if_needed() {
        nohup env TOPIC_RAW=\"\${topic}\" CHANNEL_FILTER=\"\${channel}\" KAFKA_GROUP_ID=\"\${group_id}\" SPARK_CHECKPOINT_DIR=\"/tmp/spark-checkpoints-consumer-\${consumer_id}\" \
          /opt/spark/bin/spark-submit \
          --master spark://spark-master:7077 \
+         --conf spark.cores.max=${SPARK_STREAMING_CORES_MAX} \
+         --conf spark.executor.cores=${SPARK_STREAMING_EXECUTOR_CORES} \
+         --conf spark.executor.memory=${SPARK_STREAMING_EXECUTOR_MEMORY} \
          --conf spark.jars.ivy=/tmp/.ivy2 \
          --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1,org.postgresql:postgresql:42.7.3 \
          /opt/spark/apps/spark_streaming.py \

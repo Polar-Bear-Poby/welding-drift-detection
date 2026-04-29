@@ -26,10 +26,17 @@ DB_CONN_STR = (
     f"user={_PG_USER} password={_PG_PASS}"
 )
 HEALTH_WINDOW_MIN = 15
+TOPIC_RAW_LASER_A = os.getenv("TOPIC_RAW_LASER_A", "welding.raw.laser_a.v1")
+TOPIC_RAW_LASER_B = os.getenv("TOPIC_RAW_LASER_B", "welding.raw.laser_b.v1")
+SOURCE_LASER_A = f"kafka://{TOPIC_RAW_LASER_A}"
+SOURCE_LASER_B = f"kafka://{TOPIC_RAW_LASER_B}"
 SPARK_SUBMIT_CMD = (
     "docker exec welding-spark-master bash -lc '"
     "LINE_COUNT=${LINE_COUNT:-3}; "
     "CONSUMER_COUNT=${CONSUMER_COUNT:-$((LINE_COUNT * 2))}; "
+    "SPARK_STREAMING_CORES_MAX=${SPARK_STREAMING_CORES_MAX:-1}; "
+    "SPARK_STREAMING_EXECUTOR_CORES=${SPARK_STREAMING_EXECUTOR_CORES:-1}; "
+    "SPARK_STREAMING_EXECUTOR_MEMORY=${SPARK_STREAMING_EXECUTOR_MEMORY:-1g}; "
     "if [ $((CONSUMER_COUNT % 2)) -ne 0 ] || [ \"${CONSUMER_COUNT}\" -lt 2 ]; then "
     "  echo \"CONSUMER_COUNT must be even and >=2\"; exit 1; "
     "fi; "
@@ -46,11 +53,36 @@ SPARK_SUBMIT_CMD = (
     "  fi; "
     "  rm -rf /tmp/spark-checkpoints-consumer-${consumer_id}; "
     "  nohup env TOPIC_RAW=\"${topic}\" CHANNEL_FILTER=\"${channel}\" KAFKA_GROUP_ID=\"${group_id}\" SPARK_CHECKPOINT_DIR=\"/tmp/spark-checkpoints-consumer-${consumer_id}\" "
-    "    /opt/spark/bin/spark-submit --master spark://spark-master:7077 --conf spark.jars.ivy=/tmp/.ivy2 "
+    "    /opt/spark/bin/spark-submit --master spark://spark-master:7077 "
+    "    --conf spark.cores.max=${SPARK_STREAMING_CORES_MAX} "
+    "    --conf spark.executor.cores=${SPARK_STREAMING_EXECUTOR_CORES} "
+    "    --conf spark.executor.memory=${SPARK_STREAMING_EXECUTOR_MEMORY} "
+    "    --conf spark.jars.ivy=/tmp/.ivy2 "
     "    --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1,org.postgresql:postgresql:42.7.3 "
     "    /opt/spark/apps/spark_streaming.py >/tmp/spark_streaming_consumer_${consumer_id}.log 2>&1 & "
     "done;'"
 )
+
+
+def _recent_channel_counts(window_minutes: int) -> tuple[int, int]:
+    with psycopg2.connect(DB_CONN_STR) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT source_file, COUNT(*)
+                FROM welding.pattern_summary
+                WHERE processed_at >= NOW() - (%s || ' minutes')::interval
+                  AND source_file IN (%s, %s)
+                GROUP BY source_file
+                """,
+                (window_minutes, SOURCE_LASER_A, SOURCE_LASER_B),
+            )
+            rows = cur.fetchall()
+
+    counts = {SOURCE_LASER_A: 0, SOURCE_LASER_B: 0}
+    for source_file, count in rows:
+        counts[source_file] = int(count)
+    return counts[SOURCE_LASER_A], counts[SOURCE_LASER_B]
 
 @dag(
     dag_id="welding_streaming_monitor",
@@ -65,28 +97,36 @@ def welding_streaming_monitor_dag():
     @task.branch()
     def check_streaming_health():
         try:
-            with psycopg2.connect(DB_CONN_STR) as conn:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "SELECT COUNT(*) FROM welding.pattern_summary "
-                        "WHERE processed_at >= NOW() - INTERVAL '%s minutes' AND source_file LIKE 'kafka://%%'",
-                        (HEALTH_WINDOW_MIN,)
-                    )
-                    count = cur.fetchone()[0]
-            
-            log.info(f"Recent records: {count}")
-            return "log_healthy_heartbeat" if count > 0 else "restart_spark_streaming"
+            a_count, b_count = _recent_channel_counts(HEALTH_WINDOW_MIN)
+            log.info(
+                "Recent channel records (%s min): laser_a=%s laser_b=%s",
+                HEALTH_WINDOW_MIN,
+                a_count,
+                b_count,
+            )
+            return "log_healthy_heartbeat" if (a_count > 0 and b_count > 0) else "restart_spark_streaming"
         except Exception as e:
             log.error(f"Health check failed: {e}")
             return "log_healthy_heartbeat"
 
     @task()
     def log_healthy_heartbeat():
+        a_count, b_count = _recent_channel_counts(HEALTH_WINDOW_MIN)
         with psycopg2.connect(DB_CONN_STR) as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     "INSERT INTO welding.pipeline_heartbeat (component_name, details) "
-                    "VALUES ('airflow.streaming_monitor', '{\"status\":\"healthy\"}'::jsonb)"
+                    "VALUES (%s, %s::jsonb)",
+                    (
+                        "airflow.streaming_monitor",
+                        (
+                            "{\"status\":\"healthy\","
+                            f"\"window_min\":{HEALTH_WINDOW_MIN},"
+                            f"\"laser_a_count\":{a_count},"
+                            f"\"laser_b_count\":{b_count}"
+                            "}"
+                        ),
+                    ),
                 )
 
     restart_spark = BashOperator(
@@ -94,14 +134,17 @@ def welding_streaming_monitor_dag():
         bash_command=SPARK_SUBMIT_CMD
     )
 
-    verify_restart = BashOperator(
-        task_id="verify_restart",
-        bash_command=(
-            "sleep 60 && docker exec welding-postgres psql -U welding -d welding_drift -c \""
-            "SELECT COUNT(*) FROM welding.pattern_summary WHERE processed_at >= NOW() - INTERVAL '2 minutes' "
-            "AND source_file LIKE 'kafka://%';\""
-        )
-    )
+    @task()
+    def verify_restart():
+        import time
+
+        time.sleep(60)
+        a_count, b_count = _recent_channel_counts(2)
+        log.info("Post-restart channel records (2 min): laser_a=%s laser_b=%s", a_count, b_count)
+        if not (a_count > 0 and b_count > 0):
+            raise RuntimeError(
+                f"restart verify failed: laser_a={a_count}, laser_b={b_count}"
+            )
 
     @task(trigger_rule="one_failed")
     def notify_failure():
@@ -115,6 +158,7 @@ def welding_streaming_monitor_dag():
     # Dependency Flow
     branch = check_streaming_health()
     branch >> log_healthy_heartbeat()
-    branch >> restart_spark >> verify_restart >> notify_failure()
+    verify = verify_restart()
+    branch >> restart_spark >> verify >> notify_failure()
 
 welding_streaming_monitor_dag()
