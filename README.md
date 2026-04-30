@@ -73,7 +73,10 @@ Copy-Item .env.example .env
 ```text
 DATA_DIR=<PRIVATE_RAW_DATA_ROOT>
 STORAGE_DIR=<PRIVATE_OUTPUT_STORAGE_ROOT>
+POSTGRES_PASSWORD=<LOCAL_DB_PASSWORD>
 ```
+
+`POSTGRES_HOST`는 호스트(로컬 툴) 접속용, `POSTGRES_HOST_CONTAINER`는 컨테이너 내부 접속용입니다.
 
 EC2에서 실행할 경우 `.env`의 `KAFKA_EXTERNAL_HOST`를 EC2 public IP로 변경합니다.
 

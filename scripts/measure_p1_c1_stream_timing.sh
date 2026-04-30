@@ -44,6 +44,8 @@ MEASURE_TIMEOUT_SEC="${MEASURE_TIMEOUT_SEC:-900}"
 SPARK_STREAMING_CORES_MAX="${SPARK_STREAMING_CORES_MAX:-1}"
 SPARK_STREAMING_EXECUTOR_CORES="${SPARK_STREAMING_EXECUTOR_CORES:-1}"
 SPARK_STREAMING_EXECUTOR_MEMORY="${SPARK_STREAMING_EXECUTOR_MEMORY:-1g}"
+INFERENCE_DELAY_MS_LASER_A="${INFERENCE_DELAY_MS_LASER_A:-0}"
+INFERENCE_DELAY_MS_LASER_B="${INFERENCE_DELAY_MS_LASER_B:-0}"
 
 STOP_ALWAYS_ON_PRODUCER="${STOP_ALWAYS_ON_PRODUCER:-1}"
 RESTORE_ALWAYS_ON_PRODUCER="${RESTORE_ALWAYS_ON_PRODUCER:-1}"
@@ -154,7 +156,8 @@ start_streaming_consumer() {
   docker exec "${SPARK_MASTER_CONTAINER}" bash -lc \
     "mkdir -p /tmp/.ivy2;
      rm -rf '${checkpoint_dir}';
-     nohup env TOPIC_RAW='${topic_name}' SPARK_CHECKPOINT_DIR='${checkpoint_dir}' CHANNEL_FILTER='${channel_filter}' KAFKA_GROUP_ID='${kafka_group_id}' \
+     nohup env TOPIC_RAW='${topic_name}' SPARK_CHECKPOINT_DIR='${checkpoint_dir}' CHANNEL_FILTER='${channel_filter}' KAFKA_GROUP_ID='${kafka_group_id}' POSTGRES_PASSWORD='${POSTGRES_PASSWORD}' \
+       INFERENCE_DELAY_MS_LASER_A='${INFERENCE_DELAY_MS_LASER_A}' INFERENCE_DELAY_MS_LASER_B='${INFERENCE_DELAY_MS_LASER_B}' \
        /opt/spark/bin/spark-submit \
        --master spark://spark-master:7077 \
        --conf spark.cores.max=${SPARK_STREAMING_CORES_MAX} \
@@ -200,9 +203,10 @@ restore_default_streaming_if_needed() {
          channel='0';
          group_id='welding-stream-laser-b';
        fi;
-       rm -rf \"/tmp/spark-checkpoints-consumer-\${consumer_id}\";
-       nohup env TOPIC_RAW=\"\${topic}\" CHANNEL_FILTER=\"\${channel}\" KAFKA_GROUP_ID=\"\${group_id}\" SPARK_CHECKPOINT_DIR=\"/tmp/spark-checkpoints-consumer-\${consumer_id}\" \
-         /opt/spark/bin/spark-submit \
+        rm -rf \"/tmp/spark-checkpoints-consumer-\${consumer_id}\";
+        nohup env TOPIC_RAW=\"\${topic}\" CHANNEL_FILTER=\"\${channel}\" KAFKA_GROUP_ID=\"\${group_id}\" SPARK_CHECKPOINT_DIR=\"/tmp/spark-checkpoints-consumer-\${consumer_id}\" POSTGRES_PASSWORD='${POSTGRES_PASSWORD}' \
+          INFERENCE_DELAY_MS_LASER_A='${INFERENCE_DELAY_MS_LASER_A}' INFERENCE_DELAY_MS_LASER_B='${INFERENCE_DELAY_MS_LASER_B}' \
+          /opt/spark/bin/spark-submit \
          --master spark://spark-master:7077 \
          --conf spark.cores.max=${SPARK_STREAMING_CORES_MAX} \
          --conf spark.executor.cores=${SPARK_STREAMING_EXECUTOR_CORES} \
@@ -383,6 +387,8 @@ topic_laser_b=${TOPIC_LASER_B}
 date_folder=${DATE_FOLDER}
 line_count=${LINE_COUNT}
 consumer_count=${CONSUMER_COUNT}
+inference_delay_ms_laser_a=${INFERENCE_DELAY_MS_LASER_A}
+inference_delay_ms_laser_b=${INFERENCE_DELAY_MS_LASER_B}
 max_products=${MAX_PRODUCTS}
 expected_rows=${EXPECTED_ROWS}
 producer_start_utc=${producer_start_iso}
@@ -419,4 +425,3 @@ printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
 log "Benchmark summary saved: ${SUMMARY_TXT}"
 log "History updated: ${SUMMARY_CSV}"
 log "Result: producer_duration=${producer_duration_sec}s db_rows=${db_count}/${EXPECTED_ROWS} time_to_first_db_sec=${time_to_first_db_sec} end_to_last_db_sec=${end_to_last_db_sec} drain_after_producer_sec=${db_drain_after_producer_sec}"
-

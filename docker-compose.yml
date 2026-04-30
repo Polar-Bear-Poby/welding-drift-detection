@@ -1,3 +1,10 @@
+x-db-common-env: &db-common-env
+  POSTGRES_HOST: ${POSTGRES_HOST_CONTAINER:-postgres}
+  POSTGRES_PORT: "5432"
+  POSTGRES_DB: ${POSTGRES_DB:-welding_drift}
+  POSTGRES_USER: ${POSTGRES_USER:-welding}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+
 x-airflow-common: &airflow-common
   build:
     context: .
@@ -6,6 +13,7 @@ x-airflow-common: &airflow-common
   user: "${AIRFLOW_UID:-50000}:0"
   environment:
     &airflow-common-env
+    <<: *db-common-env
     AIRFLOW__CORE__EXECUTOR: LocalExecutor
     # PIP requirements are now in Dockerfile.airflow
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-welding}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-welding_drift}
@@ -208,6 +216,8 @@ services:
       - ${STORAGE_DIR:?set STORAGE_DIR in .env}:/storage
       - ./spark_batch.py:/opt/spark/apps/spark_batch.py:ro
       - ./spark_streaming.py:/opt/spark/apps/spark_streaming.py:ro
+    environment:
+      <<: *db-common-env
     networks:
       - welding-net
 
@@ -241,6 +251,8 @@ services:
       - ${STORAGE_DIR:?set STORAGE_DIR in .env}:/storage
       - ./spark_batch.py:/opt/spark/apps/spark_batch.py:ro
       - ./spark_streaming.py:/opt/spark/apps/spark_streaming.py:ro
+    environment:
+      <<: *db-common-env
     networks:
       - welding-net
 
@@ -304,6 +316,7 @@ services:
       kafka-init:
         condition: service_completed_successfully
     environment:
+      <<: *db-common-env
       KAFKA_BOOTSTRAP: kafka:9092
       TOPIC_RAW: welding.raw.v1
       TOPIC_RAW_LASER_A: welding.raw.laser_a.v1

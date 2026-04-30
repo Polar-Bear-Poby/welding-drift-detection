@@ -8,6 +8,7 @@ performs pattern splitting, and stores the results in PostgreSQL.
 import os
 import logging
 import uuid
+import time
 from pathlib import Path
 from typing import List
 
@@ -48,6 +49,8 @@ POSTGRES_USER = os.getenv("POSTGRES_USER", "welding")
 POSTGRES_PASS = os.getenv("POSTGRES_PASSWORD", "")
 LASER_A_MODEL_NAME = os.getenv("LASER_A_MODEL_NAME", "laser_a_placeholder_model")
 LASER_B_MODEL_NAME = os.getenv("LASER_B_MODEL_NAME", "laser_b_placeholder_model")
+INFERENCE_DELAY_MS_LASER_A = float(os.getenv("INFERENCE_DELAY_MS_LASER_A", "0"))
+INFERENCE_DELAY_MS_LASER_B = float(os.getenv("INFERENCE_DELAY_MS_LASER_B", "0"))
 
 # --- JSON Schema for Kafka Messages ---
 # Based on producer.py message format
@@ -126,6 +129,8 @@ def analyze_laser_a(signal: List[float]) -> dict:
     Placeholder route for Laser A model inference.
     TODO: replace proxy with real Laser A drift model inference.
     """
+    if INFERENCE_DELAY_MS_LASER_A > 0:
+        time.sleep(INFERENCE_DELAY_MS_LASER_A / 1000.0)
     result = split_patterns_and_score(signal)
     result["model_name"] = LASER_A_MODEL_NAME
     return result
@@ -136,6 +141,8 @@ def analyze_laser_b(signal: List[float]) -> dict:
     Placeholder route for Laser B model inference.
     TODO: replace proxy with real Laser B drift model inference.
     """
+    if INFERENCE_DELAY_MS_LASER_B > 0:
+        time.sleep(INFERENCE_DELAY_MS_LASER_B / 1000.0)
     result = split_patterns_and_score(signal)
     result["model_name"] = LASER_B_MODEL_NAME
     return result
@@ -237,6 +244,11 @@ def main():
         CHANNEL_FILTER if CHANNEL_FILTER is not None else "all",
         ",".join(LINE_FILTERS) if LINE_FILTERS else "all",
         SPARK_CHECKPOINT_DIR,
+    )
+    logger.info(
+        "Inference delay config (ms): laser_a=%s laser_b=%s",
+        INFERENCE_DELAY_MS_LASER_A,
+        INFERENCE_DELAY_MS_LASER_B,
     )
     if KAFKA_GROUP_ID:
         logger.info("Kafka consumer group id: %s", KAFKA_GROUP_ID)
