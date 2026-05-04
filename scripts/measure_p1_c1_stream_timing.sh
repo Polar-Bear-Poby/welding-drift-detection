@@ -2,6 +2,24 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ENV_FILE="${ENV_FILE:-${ROOT_DIR}/.env}"
+
+load_env_file() {
+  local env_file="$1"
+  if [[ ! -f "${env_file}" ]]; then
+    return 0
+  fi
+  set -a
+  # shellcheck disable=SC1090
+  source <(
+    sed 's/\r$//' "${env_file}" \
+      | grep -v '^[[:space:]]*#' \
+      | grep -v '^[[:space:]]*$'
+  )
+  set +a
+}
+
+load_env_file "${ENV_FILE}"
 
 HOST_DATA_DIR="${HOST_DATA_DIR:-${ROOT_DIR}/data}"
 DATE_FOLDER="${DATE_FOLDER:-20220417}"
@@ -10,15 +28,18 @@ STORAGE_DIR_IN_CONTAINER="${STORAGE_DIR_IN_CONTAINER:-/storage}"
 HOST_STORAGE_DIR="${HOST_STORAGE_DIR:-${ROOT_DIR}/storage}"
 
 LINE_COUNT="${LINE_COUNT:-3}"
+PRODUCER_COUNT="${PRODUCER_COUNT:-1}"
 SPEED="${SPEED:-300}"
 MAX_PRODUCTS="${MAX_PRODUCTS:-3}"
+TARGET_PRODUCTS="${TARGET_PRODUCTS:-0}"
+LINE_SEEDS="${LINE_SEEDS:-}"
 REPLAY_SPEED="${REPLAY_SPEED:-${SPEED}}"
 CONSUMER_COUNT="${CONSUMER_COUNT:-$((LINE_COUNT * 2))}"
 EXPECTED_ROWS="${EXPECTED_ROWS:-$((MAX_PRODUCTS * LINE_COUNT * 2))}"
 
 KAFKA_BOOTSTRAP="${KAFKA_BOOTSTRAP:-kafka:9092}"
 NETWORK_NAME="${NETWORK_NAME:-welding-kafka-submission_welding-net}"
-PRODUCER_IMAGE="${PRODUCER_IMAGE:-welding-producer:latest}"
+PRODUCER_IMAGE="${PRODUCER_IMAGE:-welding-kafka-submission-producer:latest}"
 KAFKA_CONTAINER="${KAFKA_CONTAINER:-welding-kafka}"
 SPARK_MASTER_CONTAINER="${SPARK_MASTER_CONTAINER:-welding-spark-master}"
 POSTGRES_CONTAINER="${POSTGRES_CONTAINER:-welding-postgres}"
@@ -26,10 +47,6 @@ POSTGRES_CONTAINER="${POSTGRES_CONTAINER:-welding-postgres}"
 POSTGRES_DB="${POSTGRES_DB:-welding_drift}"
 POSTGRES_USER="${POSTGRES_USER:-welding}"
 POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-}"
-if [[ -z "${POSTGRES_PASSWORD}" ]]; then
-  echo "ERROR: POSTGRES_PASSWORD must be set" >&2
-  exit 1
-fi
 
 RUN_TS="${RUN_TS:-$(date +%Y%m%d_%H%M%S)}"
 RUN_TAG="${RUN_TAG:-nline_even_${RUN_TS}}"
@@ -93,6 +110,23 @@ parse_args() {
 
 log() {
   printf '[%s] %s\n' "$(date '+%F %T')" "$*"
+}
+
+start_producer_tailer() {
+  local log_file="$1"
+  local label="$2"
+  # Stream per-producer file logs into this script stdout so outer out.log collects merged progress.
+  ( tail -n 0 -F "${log_file}" 2>/dev/null | sed -u "s/^/[${label}] /" ) &
+}
+
+stop_producer_tailers() {
+  local tailer_pid
+  for tailer_pid in "$@"; do
+    if [[ -n "${tailer_pid}" ]] && kill -0 "${tailer_pid}" 2>/dev/null; then
+      kill "${tailer_pid}" 2>/dev/null || true
+      wait "${tailer_pid}" 2>/dev/null || true
+    fi
+  done
 }
 
 require_cmd() {
@@ -196,11 +230,11 @@ restore_default_streaming_if_needed() {
      for consumer_id in \$(seq 1 ${CONSUMER_COUNT}); do
        if [ \$((consumer_id % 2)) -eq 1 ]; then
          topic='${TOPIC_RAW_LASER_A}';
-         channel='1';
+         channel='laser_a';
          group_id='welding-stream-laser-a';
        else
          topic='${TOPIC_RAW_LASER_B}';
-         channel='0';
+         channel='laser_b';
          group_id='welding-stream-laser-b';
        fi;
         rm -rf \"/tmp/spark-checkpoints-consumer-\${consumer_id}\";
@@ -241,9 +275,28 @@ ensure_container_running "${KAFKA_CONTAINER}"
 ensure_container_running "${SPARK_MASTER_CONTAINER}"
 ensure_container_running "${POSTGRES_CONTAINER}"
 
+if [[ -z "${POSTGRES_PASSWORD}" ]]; then
+  POSTGRES_PASSWORD="$(
+    docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "${POSTGRES_CONTAINER}" 2>/dev/null \
+      | awk -F= '$1=="POSTGRES_PASSWORD"{print $2; exit}'
+  )"
+fi
+if [[ -z "${POSTGRES_PASSWORD}" ]]; then
+  echo "ERROR: POSTGRES_PASSWORD must be set (env/.env/container env)." >&2
+  exit 1
+fi
+
 if (( CONSUMER_COUNT < 2 || CONSUMER_COUNT % 2 != 0 )); then
   echo "ERROR: CONSUMER_COUNT must be an even number >= 2 (current=${CONSUMER_COUNT})" >&2
   exit 1
+fi
+if (( PRODUCER_COUNT < 1 )); then
+  echo "ERROR: PRODUCER_COUNT must be >= 1 (current=${PRODUCER_COUNT})" >&2
+  exit 1
+fi
+if (( PRODUCER_COUNT > 1 )) && (( LINE_COUNT != PRODUCER_COUNT )); then
+  log "LINE_COUNT(${LINE_COUNT}) adjusted to PRODUCER_COUNT(${PRODUCER_COUNT}) for 1 producer = 1 line mode."
+  LINE_COUNT="${PRODUCER_COUNT}"
 fi
 
 if [[ ! -d "${HOST_DATA_DIR}/${DATE_FOLDER}" ]]; then
@@ -254,7 +307,7 @@ fi
 mkdir -p "${METRICS_DIR}"
 if [[ ! -f "${SUMMARY_CSV}" ]]; then
   cat > "${SUMMARY_CSV}" <<EOF
-run_tag,topic_laser_a,topic_laser_b,date_folder,line_count,consumer_count,max_products,expected_rows,producer_start_utc,producer_end_utc,producer_duration_sec,db_first_utc,db_last_utc,time_to_first_db_sec,end_to_last_db_sec,db_drain_after_producer_sec,db_rows
+run_tag,topic_laser_a,topic_laser_b,date_folder,line_count,consumer_count,max_products,target_products,line_seeds,expected_rows,producer_start_utc,producer_end_utc,producer_duration_sec,db_first_utc,db_last_utc,time_to_first_db_sec,end_to_last_db_sec,db_drain_after_producer_sec,db_rows
 EOF
 fi
 
@@ -288,11 +341,11 @@ for consumer_id in $(seq 1 "${CONSUMER_COUNT}"); do
 
   if (( consumer_id % 2 == 1 )); then
     topic="${TOPIC_LASER_A}"
-    channel_filter="1"
+    channel_filter="laser_a"
     group_id="welding-stream-laser-a"
   else
     topic="${TOPIC_LASER_B}"
-    channel_filter="0"
+    channel_filter="laser_b"
     group_id="welding-stream-laser-b"
   fi
 
@@ -308,7 +361,7 @@ log "Benchmark consumers started. topic_laser_a=${TOPIC_LASER_A}, topic_laser_b=
 
 producer_start_iso="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 producer_start_epoch="$(date +%s)"
-log "Producer run start: line_count=${LINE_COUNT} max_products=${MAX_PRODUCTS} speed=${REPLAY_SPEED}"
+log "Producer run start: producer_count=${PRODUCER_COUNT} line_count=${LINE_COUNT} max_products=${MAX_PRODUCTS} target_products=${TARGET_PRODUCTS} speed=${REPLAY_SPEED} line_seeds=${LINE_SEEDS:-none}"
 
 producer_args=(
   --data-dir "${DATA_DIR_IN_CONTAINER}/${DATE_FOLDER}"
@@ -322,14 +375,86 @@ producer_args=(
 if [[ "${MAX_PRODUCTS}" != "0" ]]; then
   producer_args+=(--max-products "${MAX_PRODUCTS}")
 fi
+if [[ "${TARGET_PRODUCTS}" != "0" ]]; then
+  producer_args+=(--target-products "${TARGET_PRODUCTS}")
+fi
+if [[ -n "${LINE_SEEDS}" ]]; then
+  producer_args+=(--line-seed "${LINE_SEEDS}")
+fi
 
-docker run --rm \
-  --network "${NETWORK_NAME}" \
-  -v "${HOST_DATA_DIR}:${DATA_DIR_IN_CONTAINER}:ro" \
-  -v "${HOST_STORAGE_DIR}:${STORAGE_DIR_IN_CONTAINER}" \
-  -v "${ROOT_DIR}/producer.py:/app/producer.py:ro" \
-  "${PRODUCER_IMAGE}" \
-  "${producer_args[@]}"
+if (( PRODUCER_COUNT == 1 )); then
+  docker run --rm \
+    --network "${NETWORK_NAME}" \
+    -v "${HOST_DATA_DIR}:${DATA_DIR_IN_CONTAINER}:ro" \
+    -v "${HOST_STORAGE_DIR}:${STORAGE_DIR_IN_CONTAINER}" \
+    -v "${ROOT_DIR}/producer.py:/app/producer.py:ro" \
+    "${PRODUCER_IMAGE}" \
+    "${producer_args[@]}" 2>&1 | sed -u 's/^/[producer-line-01] /'
+else
+  if (( TARGET_PRODUCTS <= 0 )); then
+    echo "ERROR: TARGET_PRODUCTS must be > 0 when PRODUCER_COUNT > 1" >&2
+    exit 1
+  fi
+
+  producer_pids=()
+  producer_logs=()
+  producer_tailer_pids=()
+  base=$((TARGET_PRODUCTS / PRODUCER_COUNT))
+  rem=$((TARGET_PRODUCTS % PRODUCER_COUNT))
+
+  for producer_idx in $(seq 1 "${PRODUCER_COUNT}"); do
+    shard_index=$((producer_idx - 1))
+    target_for_this="${base}"
+    if (( shard_index < rem )); then
+      target_for_this=$((target_for_this + 1))
+    fi
+    if (( target_for_this <= 0 )); then
+      continue
+    fi
+
+    producer_log="/tmp/producer_${RUN_TAG}_line_${producer_idx}.log"
+    producer_logs+=("${producer_log}")
+    log "Launching producer line=${producer_idx} shard=${shard_index}/${PRODUCER_COUNT} target_products=${target_for_this}"
+
+    producer_cmd=(
+      docker run --rm
+      --network "${NETWORK_NAME}"
+      -v "${HOST_DATA_DIR}:${DATA_DIR_IN_CONTAINER}:ro"
+      -v "${HOST_STORAGE_DIR}:${STORAGE_DIR_IN_CONTAINER}"
+      -v "${ROOT_DIR}/producer.py:/app/producer.py:ro"
+      "${PRODUCER_IMAGE}"
+      "${producer_args[@]}"
+      --line-count 1
+      --line-number "${producer_idx}"
+      --shard-index "${shard_index}"
+      --shard-total "${PRODUCER_COUNT}"
+      --target-products "${target_for_this}"
+    )
+
+    "${producer_cmd[@]}" >"${producer_log}" 2>&1 &
+    producer_pids+=("$!")
+    start_producer_tailer "${producer_log}" "producer-line-${producer_idx}"
+    producer_tailer_pids+=("$!")
+  done
+
+  failed=0
+  for pid in "${producer_pids[@]}"; do
+    if ! wait "${pid}"; then
+      failed=1
+    fi
+  done
+  stop_producer_tailers "${producer_tailer_pids[@]}"
+  if (( failed == 1 )); then
+    for plog in "${producer_logs[@]}"; do
+      if [[ -f "${plog}" ]]; then
+        log "Producer log tail: ${plog}"
+        tail -n 80 "${plog}" || true
+      fi
+    done
+    echo "ERROR: one or more producer containers failed." >&2
+    exit 1
+  fi
+fi
 
 producer_end_iso="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 producer_end_epoch="$(date +%s)"
@@ -386,10 +511,13 @@ topic_laser_a=${TOPIC_LASER_A}
 topic_laser_b=${TOPIC_LASER_B}
 date_folder=${DATE_FOLDER}
 line_count=${LINE_COUNT}
+producer_count=${PRODUCER_COUNT}
 consumer_count=${CONSUMER_COUNT}
 inference_delay_ms_laser_a=${INFERENCE_DELAY_MS_LASER_A}
 inference_delay_ms_laser_b=${INFERENCE_DELAY_MS_LASER_B}
 max_products=${MAX_PRODUCTS}
+target_products=${TARGET_PRODUCTS}
+line_seeds=${LINE_SEEDS}
 expected_rows=${EXPECTED_ROWS}
 producer_start_utc=${producer_start_iso}
 producer_end_utc=${producer_end_iso}
@@ -403,7 +531,7 @@ db_rows=${db_count}
 consumer_log_prefix=${CONSUMER_LOG_BASE}
 EOF
 
-printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
   "${RUN_TAG}" \
   "${TOPIC_LASER_A}" \
   "${TOPIC_LASER_B}" \
@@ -411,6 +539,8 @@ printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
   "${LINE_COUNT}" \
   "${CONSUMER_COUNT}" \
   "${MAX_PRODUCTS}" \
+  "${TARGET_PRODUCTS}" \
+  "${LINE_SEEDS}" \
   "${EXPECTED_ROWS}" \
   "${producer_start_iso}" \
   "${producer_end_iso}" \

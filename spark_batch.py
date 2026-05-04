@@ -370,12 +370,13 @@ def build_summary_df(segments_df: DataFrame, cpd_threshold: float) -> DataFrame:
         )
         .withColumn("window_start", F.date_trunc("hour", F.col("processed_at")))
         .withColumn("window_end", F.expr("window_start + INTERVAL 1 HOUR"))
-        # NOTE(temporary): 실제 드리프트 모델이 아직 없으므로
-        #                  quality_decision은 임시로 모두 PASS로 고정한다.
-        # TODO(CPD): 모델 적용 후 PASS/WARNING/HOLD 등으로 복원.
+        # 배터리 1공정 = pattern_summary 1행.
+        # 16개 세그먼트를 집계한 cpd_score(proxy)가 threshold 이상이면 "drift",
+        # 미만이면 "normal"로 기록한다.
+        # 실제 CPD 알고리즘 적용 시 이 withColumn만 교체하면 된다.
         .withColumn(
             "quality_decision",
-            F.lit("PASS"),
+            F.when(F.col("cpd_score") >= F.lit(cpd_threshold), F.lit("drift")).otherwise(F.lit("normal")),
         )
     )
 
@@ -429,7 +430,10 @@ def write_drift_artifacts(
     drift_segments_path = str(output_root / "segments")
     drift_raw_path = str(output_root / "raw_files")
 
-    drift_summary_df = summary_df.filter(F.col("quality_decision") != F.lit("PASS")).cache()
+    # drift 추출: quality_decision == 'drift' 인 행만 대상
+    # (이전: != 'PASS' → "normal"까지 전량 추출되는 버그 수정)
+    drift_summary_df = summary_df.filter(F.col("quality_decision") == F.lit("drift")).cache()
+
     drift_summary_count = drift_summary_df.count()
     if drift_summary_count == 0:
         return 0, 0, 0, drift_summary_path, drift_segments_path, drift_raw_path
@@ -580,6 +584,7 @@ def write_postgres(
     finished_at: datetime,
     output_dir: str,
     total_files: int,
+    line_count: int,
     host: str,
     port: int,
     dbname: str,
@@ -688,6 +693,12 @@ def write_postgres(
             conn, summary_sql, _iter_tuples(summary_df, summary_cols), batch_size=1000
         )
 
+        import json as _json
+        details_json = _json.dumps({
+            # 1 producer = 1 production line → producer_count == line_count
+            "line_count": line_count,
+            "producer_count": line_count,
+        })
         with conn.cursor() as cur:
             cur.execute(
                 """
@@ -695,7 +706,7 @@ def write_postgres(
                     run_id, status, started_at, finished_at, total_files,
                     total_segment_rows, total_summary_rows, output_dir, details
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, '{}'::jsonb)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
                 ON CONFLICT (run_id) DO UPDATE
                 SET
                     status = EXCLUDED.status,
@@ -703,7 +714,8 @@ def write_postgres(
                     total_files = EXCLUDED.total_files,
                     total_segment_rows = EXCLUDED.total_segment_rows,
                     total_summary_rows = EXCLUDED.total_summary_rows,
-                    output_dir = EXCLUDED.output_dir
+                    output_dir = EXCLUDED.output_dir,
+                    details = EXCLUDED.details
                 """,
                 (
                     run_id,
@@ -714,6 +726,7 @@ def write_postgres(
                     segment_count,
                     summary_count,
                     output_dir,
+                    details_json,
                 ),
             )
         conn.commit()
@@ -832,6 +845,9 @@ def run(args: argparse.Namespace) -> int:
         finished_at = datetime.now(timezone.utc)
 
         if args.write_postgres:
+            # 이 배치에서 처리된 고유 생산라인 수 = 프로듀서 컨테이너 수
+            line_count = summary_df.select("line_id").distinct().count()
+            logger.info("line_count=%s (= producer_count)", line_count)
             seg_written, sum_written = write_postgres(
                 summary_df=summary_df,
                 segments_df=segments_df,
@@ -840,6 +856,7 @@ def run(args: argparse.Namespace) -> int:
                 finished_at=finished_at,
                 output_dir=args.output_dir,
                 total_files=len(files),
+                line_count=line_count,
                 host=args.postgres_host,
                 port=args.postgres_port,
                 dbname=args.postgres_db,

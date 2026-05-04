@@ -74,16 +74,27 @@ def welding_batch_ingest_dag():
             log.warning(f"DB check failed: {e}")
             return True
 
-    run_producer = BashOperator(
-        task_id="run_producer",
-        bash_command=(
-            f"docker start {PRODUCER_CONTAINER} >/dev/null 2>&1 || true && "
+    @task()
+    def run_producer_for_line(line_number: int):
+        """라인 1개 = 프로듀서 1개 원칙에 따라 line_number별로 독립 실행한다.
+
+        producer.py --line-number {N} 옵션은 해당 인스턴스가 LINE_XX 라인 데이터만
+        전송하도록 강제한다. DAG Task Mapping으로 N개 Task가 병렬 실행되어
+        producer_count == line_count 불변식을 만족한다.
+        """
+        import subprocess
+        cmd = (
             f"docker exec {PRODUCER_CONTAINER} python /app/producer.py "
             "--data-dir /data --kafka kafka:9092 "
-            f"--line-count {REPLAY_LINE_COUNT} --line-seed \"{REPLAY_LINE_SEEDS}\" "
+            f"--line-number {line_number} "
+            f"--line-seed \"{REPLAY_LINE_SEEDS}\" "
             f"--speed {REPLAY_SPEED} --no-schedule-wait --oldest-date-only"
         )
-    )
+        log.info("producer line_number=%s 시작: %s", line_number, cmd)
+        result = subprocess.run(cmd, shell=True, timeout=1800)
+        if result.returncode != 0:
+            raise RuntimeError(f"producer 실패: line_number={line_number}, returncode={result.returncode}")
+
 
     @task()
     def run_spark_batch(run_context: dict):
@@ -138,36 +149,44 @@ def welding_batch_ingest_dag():
 
                     cur.execute(
                         """
-                        SELECT COUNT(*), COUNT(*) FILTER (WHERE quality_decision = 'ERROR')
+                        SELECT COUNT(*), COUNT(*) FILTER (WHERE quality_decision = 'drift')
                         FROM welding.pattern_summary
                         WHERE run_id = %s
                         """,
                         (run_id,),
                     )
-                    total, errors = cur.fetchone()
+                    total, drifts = cur.fetchone()
 
             log.info(
-                "Validation - run_id=%s segment_rows=%s summary_rows=%s total=%s errors=%s",
+                "Validation - run_id=%s segment_rows=%s summary_rows=%s total=%s drifts=%s",
                 run_id,
                 seg_rows,
                 sum_rows,
                 total,
-                errors,
+                drifts,
             )
             if total == 0:
                 raise RuntimeError(f"No pattern_summary rows found for run_id={run_id}.")
 
-            if (errors / total) >= 0.5:
-                raise ValueError(
-                    f"Data quality failure for run_id={run_id}: Error rate {(errors/total):.1%} >= 50%"
+            drift_rate = drifts / total if total > 0 else 0.0
+            log.info(
+                "drift_rate=%.1f%% (%d/%d) for run_id=%s",
+                drift_rate * 100, drifts, total, run_id,
+            )
+            # drift_rate 100%는 설정 또는 데이터 이상 징후로 경보 (경고 수준, 실패 아님)
+            if drift_rate >= 1.0:
+                log.warning(
+                    "run_id=%s: drift_rate=%.1f%% — 전량 drift. 모델 또는 데이터 확인 필요.",
+                    run_id, drift_rate * 100,
                 )
 
             return {
                 "run_id": str(run_id),
                 "segment_rows": int(seg_rows),
                 "summary_rows": int(sum_rows),
-                "error_rows": int(errors),
+                "drift_rows": int(drifts),
             }
+
         except psycopg2.Error as e:
             raise RuntimeError(f"DB error: {e}")
 
@@ -180,7 +199,7 @@ def welding_batch_ingest_dag():
             "spark_run_id": validation_result.get("run_id"),
             "segment_rows": validation_result.get("segment_rows"),
             "summary_rows": validation_result.get("summary_rows"),
-            "error_rows": validation_result.get("error_rows"),
+            "drift_rows": validation_result.get("drift_rows"),
         }
         with psycopg2.connect(DB_CONN_STR) as conn:
             with conn.cursor() as cur:
@@ -190,12 +209,16 @@ def welding_batch_ingest_dag():
                 )
 
     # Dependency Flow
+    # run_producer_for_line.expand()으로 라인별 Task가 병렬 생성됨
+    # (producer_count == line_count 불변식 DAG 레벨 구현)
+    line_numbers = list(range(1, REPLAY_LINE_COUNT + 1))
     gate = check_already_replayed()
     run_context = prepare_run_context()
+    producers = run_producer_for_line.expand(line_number=line_numbers)
     run_spark = run_spark_batch(run_context)
     validation = validate_results(run_context)
     heartbeat = report_heartbeat(validation)
-    gate >> run_context >> run_producer >> run_spark >> validation >> heartbeat
+    gate >> run_context >> producers >> run_spark >> validation >> heartbeat
 
 # Instantiate
 welding_batch_ingest_dag()

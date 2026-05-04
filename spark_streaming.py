@@ -10,7 +10,7 @@ import logging
 import uuid
 import time
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql import functions as F
@@ -41,7 +41,7 @@ KAFKA_GROUP_ID = os.getenv("KAFKA_GROUP_ID", "").strip()
 LINE_SLOT_INDEX = int(os.getenv("LINE_SLOT_INDEX", "0"))
 LINE_SLOT_COUNT = int(os.getenv("LINE_SLOT_COUNT", "1"))
 CHANNEL_FILTER_RAW = os.getenv("CHANNEL_FILTER", "").strip()
-CHANNEL_FILTER = int(CHANNEL_FILTER_RAW) if CHANNEL_FILTER_RAW else None
+CHANNEL_FILTER: Optional[int] = None
 LINE_FILTER_RAW = os.getenv("LINE_FILTER", "").strip()
 LINE_FILTERS = [token.strip() for token in LINE_FILTER_RAW.split(",") if token.strip()]
 POSTGRES_URL = f"jdbc:postgresql://{os.getenv('POSTGRES_HOST', 'postgres')}:{os.getenv('POSTGRES_PORT', '5432')}/{os.getenv('POSTGRES_DB', 'welding_drift')}?stringtype=unspecified"
@@ -51,6 +51,22 @@ LASER_A_MODEL_NAME = os.getenv("LASER_A_MODEL_NAME", "laser_a_placeholder_model"
 LASER_B_MODEL_NAME = os.getenv("LASER_B_MODEL_NAME", "laser_b_placeholder_model")
 INFERENCE_DELAY_MS_LASER_A = float(os.getenv("INFERENCE_DELAY_MS_LASER_A", "0"))
 INFERENCE_DELAY_MS_LASER_B = float(os.getenv("INFERENCE_DELAY_MS_LASER_B", "0"))
+
+
+def parse_channel_filter(raw: str) -> Optional[int]:
+    token = raw.strip().lower()
+    if not token:
+        return None
+    if token in ("laser_b", "ch1", "lb", "0"):
+        return 0
+    if token in ("laser_a", "ch0", "la", "1"):
+        return 1
+    raise ValueError(
+        "CHANNEL_FILTER must be one of: laser_a, laser_b, 0, 1, ch0, ch1, la, lb"
+    )
+
+
+CHANNEL_FILTER = parse_channel_filter(CHANNEL_FILTER_RAW)
 
 # --- JSON Schema for Kafka Messages ---
 # Based on producer.py message format
@@ -86,8 +102,9 @@ SIGNAL_MESSAGE_SCHEMA = T.StructType([
 def split_patterns_and_score(signal: List[float], pattern_count: int = 16) -> dict:
     """Split signal and compute a simple cpd proxy score."""
     if not signal or len(signal) < pattern_count:
-        # NOTE(temporary): 모델 미적용 기간에는 정상(PASS)으로 기록한다.
-        return {"cpd_score": 0.0, "decision": "PASS"}
+        # NOTE(temporary): 모델 미적용 기간에는 정상(normal)으로 기록한다.
+        # [fix] 'PASS' → 'normal': spark_batch.py와 동일한 값 체계로 통일
+        return {"cpd_score": 0.0, "decision": "normal"}
 
     # Split into 16 segments
     total = len(signal)
@@ -112,16 +129,19 @@ def split_patterns_and_score(signal: List[float], pattern_count: int = 16) -> di
             even_means.append(mean_val)
             
     if not odd_means or not even_means:
-        # NOTE(temporary): 모델 미적용 기간에는 정상(PASS)으로 기록한다.
-        return {"cpd_score": 0.0, "decision": "PASS"}
+        # NOTE(temporary): 모델 미적용 기간에는 정상(normal)으로 기록한다.
+        # [fix] 'PASS' → 'normal'
+        return {"cpd_score": 0.0, "decision": "normal"}
         
     avg_odd = sum(odd_means) / len(odd_means)
     avg_even = sum(even_means) / len(even_means)
     cpd_score = abs(avg_odd - avg_even)
-    # NOTE(temporary): 모델 미적용 기간에는 정상(PASS)으로 기록한다.
-    decision = "PASS"
+    # NOTE(temporary): 모델 미적용 기간에는 정상(normal)으로 기록한다.
+    # [fix] 'PASS' → 'normal': spark_batch.py와 동일한 값 체계로 통일
+    decision = "normal"
     
     return {"cpd_score": float(cpd_score), "decision": decision}
+
 
 
 def analyze_laser_a(signal: List[float]) -> dict:
@@ -153,7 +173,9 @@ def analyze_by_channel(channel: int, signal: List[float]) -> dict:
         return analyze_laser_a(signal)
     if channel == 0:
         return analyze_laser_b(signal)
-    return {"cpd_score": 0.0, "decision": "PASS", "model_name": "unknown_channel"}
+    # [fix] 'PASS' → 'normal': 알 수 없는 채널도 동일한 값 체계 적용
+    return {"cpd_score": 0.0, "decision": "normal", "model_name": "unknown_channel"}
+
 
 # UDF wrapper for the analysis logic
 @F.udf(returnType=T.StructType([
@@ -225,9 +247,6 @@ def main():
         raise ValueError("LINE_SLOT_COUNT must be >= 1")
     if LINE_SLOT_INDEX < 0 or LINE_SLOT_INDEX >= LINE_SLOT_COUNT:
         raise ValueError("LINE_SLOT_INDEX must satisfy 0 <= index < LINE_SLOT_COUNT")
-    if CHANNEL_FILTER is not None and CHANNEL_FILTER not in (0, 1):
-        raise ValueError("CHANNEL_FILTER must be 0 or 1 when set")
-
     spark = SparkSession.builder \
         .appName("welding-spark-streaming") \
         .config("spark.sql.shuffle.partitions", "2") \

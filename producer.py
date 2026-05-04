@@ -339,7 +339,8 @@ def scan_data_dir(data_dir: str) -> list[ProductRecord]:
                 instance_id = f"{parts['date']}_{product_id}"
                 event_time = parse_event_time(parts["date"], "000000")
             else:
-                # 3순위: DATA_DIR\{date}\out|reflect\*.csv 구조를 지원한다.
+                # 3순위: DATA_DIR\{date}\laser_a|laser_b\*.csv 구조를 지원한다.
+                # (legacy: out|reflect 폴더도 하위 호환으로 인식)
                 # 폴더명이 채널을 알려주면 파일명은 제품 id로 사용한다.
                 data_date = infer_date_from_path(root, csv_path)
                 if folder_channel is None or data_date is None:
@@ -582,6 +583,7 @@ def make_publish_items(
     line_count: int,
     line_interval_seconds: float,
     line_seeds: list[int] | None = None,
+    forced_line_number: int | None = None,
 ) -> list[PublishItem]:
     """Create line-aware replay items for demo/load-test scenarios.
 
@@ -616,9 +618,17 @@ def make_publish_items(
         product_index = index // line_count
         line_pool = per_line_records[line_index]
         source = line_pool[product_index % len(line_pool)]
-        line_id = source.line_id if line_count == 1 else f"LINE_{line_index + 1:02d}"
         if line_count == 1:
-            line_number = line_number_from_line_id(line_id)
+            if forced_line_number is not None:
+                line_id = f"LINE_{forced_line_number:02d}"
+                line_number = forced_line_number
+            else:
+                line_id = source.line_id
+        else:
+            line_id = f"LINE_{line_index + 1:02d}"
+        if line_count == 1:
+            if forced_line_number is None:
+                line_number = line_number_from_line_id(line_id)
         is_replay = product_index >= len(line_pool) or line_id != source.line_id
         replay_no = product_index // len(line_pool)
         product_instance_id = (
@@ -771,6 +781,35 @@ def run(args: argparse.Namespace) -> int:
             "Filtered to oldest date %s: %s product instances", oldest_date, len(records)
         )
 
+    if args.shard_total < 1:
+        logger.error("--shard-total must be >= 1")
+        return 1
+    if args.shard_index < 0 or args.shard_index >= args.shard_total:
+        logger.error(
+            "--shard-index must satisfy 0 <= shard_index < shard_total (got %s/%s)",
+            args.shard_index,
+            args.shard_total,
+        )
+        return 1
+    if args.shard_total > 1:
+        sharded = [
+            record
+            for idx, record in enumerate(records)
+            if idx % args.shard_total == args.shard_index
+        ]
+        logger.info(
+            "Shard filter applied. shard=%s/%s kept=%s from total=%s",
+            args.shard_index,
+            args.shard_total,
+            len(sharded),
+            len(records),
+        )
+        records = sharded
+
+    if args.line_number is not None and args.line_number < 1:
+        logger.error("--line-number must be >= 1")
+        return 1
+
     if not records:
         logger.error("No matching product files found.")
         return 2
@@ -791,6 +830,7 @@ def run(args: argparse.Namespace) -> int:
         line_count=args.line_count,
         line_interval_seconds=args.line_interval_seconds,
         line_seeds=line_seeds,
+        forced_line_number=args.line_number,
     )
 
     if args.dry_run:
@@ -971,6 +1011,24 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         "--line-seed",
         default=None,
         help="Comma-separated random seeds for per-line shuffle, e.g. '1,2,3'",
+    )
+    parser.add_argument(
+        "--line-number",
+        type=int,
+        default=None,
+        help="Force emitted line id to LINE_XX when line-count=1 (1 producer = 1 line mode).",
+    )
+    parser.add_argument(
+        "--shard-index",
+        type=int,
+        default=0,
+        help="0-based shard index for product record partitioning.",
+    )
+    parser.add_argument(
+        "--shard-total",
+        type=int,
+        default=1,
+        help="Total number of shards for product record partitioning.",
     )
     pair_group = parser.add_mutually_exclusive_group()
     pair_group.add_argument(

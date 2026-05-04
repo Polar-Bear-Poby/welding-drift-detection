@@ -9,6 +9,11 @@ dependencies = [
     "numpy==1.26.4",
     "psycopg2-binary==2.9.9",
     "pyspark==3.5.1",
+    "fastapi==0.115.5",
+    "uvicorn[standard]==0.32.0",
+    "streamlit==1.40.1",
+    "requests==2.32.3",
+    "pandas==2.2.3",
 ]
 
 [tool.uv]

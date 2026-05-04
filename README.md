@@ -109,6 +109,37 @@ username: <AIRFLOW_ADMIN_USER>
 password: <AIRFLOW_ADMIN_PASSWORD>
 ```
 
+### 2-2. Prometheus + Grafana 실행 (선택, monitoring profile)
+
+```bash
+docker compose --profile monitoring up -d prometheus grafana kafka-exporter postgres-exporter cadvisor node-exporter
+```
+
+Prometheus UI:
+
+```text
+http://localhost:9090
+```
+
+Grafana UI:
+
+```text
+http://localhost:3000
+```
+
+기본 계정은 `.env`의 값을 사용합니다.
+
+```text
+username: <GRAFANA_ADMIN_USER>
+password: <GRAFANA_ADMIN_PASSWORD>
+```
+
+중지:
+
+```bash
+docker compose --profile monitoring down
+```
+
 Kafka UI:
 
 ```text
@@ -142,10 +173,10 @@ Postgres:  postgres:5432
 ```text
 <DATA_DIR>/
 ├── 20220417/
-│   ├── out/
-│   │   └── battery_10.csv
-│   └── reflect/
-│       └── battery_10.csv
+│   ├── laser_b/
+│   │   └── 20220417_battery_10_laser_b.csv
+│   └── laser_a/
+│       └── 20220417_battery_10_laser_a.csv
 └── ...
 ```
 
@@ -250,6 +281,12 @@ Spark Batch 처리를 통해 산출된 메타데이터와 성능 및 품질 판�
 | PostgreSQL | 5432 | 15432 | 로컬 SQL 접속 |
 | Airflow Web | 8080 | 18088 | DAG 스케줄링/모니터링 |
 | Airflow Flower (reserved) | 5555 | 15555 | 향후 태스크 모니터링 |
+| Prometheus | 9090 | 9090 | 메트릭 수집/쿼리 |
+| Grafana | 3000 | 3000 | 대시보드/시각화 |
+| Kafka Exporter | 9308 | 9308 | Kafka 메트릭 |
+| Postgres Exporter | 9187 | 9187 | PostgreSQL 메트릭 |
+| cAdvisor | 8080 | 8088 | 컨테이너 리소스 메트릭 |
+| Node Exporter | 9100 | 9100 | 호스트 리소스 메트릭 |
 
 ## 테스트
 

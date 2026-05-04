@@ -50,9 +50,9 @@ SPARK_SUBMIT_CMD = (
     "mkdir -p /tmp/.ivy2; "
     "for consumer_id in $(seq 1 ${CONSUMER_COUNT}); do "
     "  if [ $((consumer_id % 2)) -eq 1 ]; then "
-    "    topic=\"welding.raw.laser_a.v1\"; channel=\"1\"; group_id=\"welding-stream-laser-a\"; "
+    "    topic=\"welding.raw.laser_a.v1\"; channel=\"laser_a\"; group_id=\"welding-stream-laser-a\"; "
     "  else "
-    "    topic=\"welding.raw.laser_b.v1\"; channel=\"0\"; group_id=\"welding-stream-laser-b\"; "
+    "    topic=\"welding.raw.laser_b.v1\"; channel=\"laser_b\"; group_id=\"welding-stream-laser-b\"; "
     "  fi; "
     "  rm -rf /tmp/spark-checkpoints-consumer-${consumer_id}; "
     "  nohup env TOPIC_RAW=\"${topic}\" CHANNEL_FILTER=\"${channel}\" KAFKA_GROUP_ID=\"${group_id}\" SPARK_CHECKPOINT_DIR=\"/tmp/spark-checkpoints-consumer-${consumer_id}\" "
@@ -68,24 +68,31 @@ SPARK_SUBMIT_CMD = (
 
 
 def _recent_channel_counts(window_minutes: int) -> tuple[int, int]:
+    """최근 window_minutes분 내 channel별 summary 행 수를 반환한다.
+
+    [fix] source_file URI 고정 필터 제거:
+    실제 DB의 pattern_summary.source_file에는 'kafka://...benchmark...' 형태의 값이
+    저장되어 있어 'kafka://welding.raw.laser_a.v1' 고정 문자열과 불일치 → 항상 0 반환.
+    channel 컬럼(1=laser_a, 0=laser_b) + processed_at 시간 윈도우 기반으로 교체.
+    """
     with psycopg2.connect(DB_CONN_STR) as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT source_file, COUNT(*)
+                SELECT channel, COUNT(*)
                 FROM welding.pattern_summary
                 WHERE processed_at >= NOW() - (%s || ' minutes')::interval
-                  AND source_file IN (%s, %s)
-                GROUP BY source_file
+                GROUP BY channel
                 """,
-                (window_minutes, SOURCE_LASER_A, SOURCE_LASER_B),
+                (window_minutes,),
             )
             rows = cur.fetchall()
 
-    counts = {SOURCE_LASER_A: 0, SOURCE_LASER_B: 0}
-    for source_file, count in rows:
-        counts[source_file] = int(count)
-    return counts[SOURCE_LASER_A], counts[SOURCE_LASER_B]
+    counts = {0: 0, 1: 0}  # 0=laser_b, 1=laser_a
+    for channel, count in rows:
+        counts[int(channel)] = int(count)
+    return counts[1], counts[0]  # (laser_a_count, laser_b_count)
+
 
 
 def _send_external_alert(title: str, details: dict) -> None:

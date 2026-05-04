@@ -339,12 +339,152 @@ services:
     networks:
       - welding-net
 
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    container_name: welding-api
+    restart: unless-stopped
+    environment:
+      <<: *db-common-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "${API_PORT:-8001}:8000"
+    networks:
+      - welding-net
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    container_name: welding-frontend
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_started
+    environment:
+      API_BASE_URL: ${API_BASE_URL:-http://api:8000}
+    ports:
+      - "${FRONTEND_PORT:-8501}:8501"
+    networks:
+      - welding-net
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: welding-prometheus
+    restart: unless-stopped
+    profiles: ["monitoring"]
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=14d"
+      - "--web.enable-lifecycle"
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    networks:
+      - welding-net
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: welding-grafana
+    restart: unless-stopped
+    profiles: ["monitoring"]
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_SERVER_DOMAIN: localhost
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+    depends_on:
+      prometheus:
+        condition: service_started
+    networks:
+      - welding-net
+
+  kafka-exporter:
+    image: danielqsj/kafka-exporter:v1.7.0
+    container_name: welding-kafka-exporter
+    restart: unless-stopped
+    profiles: ["monitoring"]
+    command:
+      - "--kafka.server=kafka:9092"
+      - "--web.listen-address=:9308"
+      - "--topic.filter=^welding\\..*"
+      - "--group.filter=^welding\\..*"
+    ports:
+      - "${KAFKA_EXPORTER_PORT:-9308}:9308"
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - welding-net
+
+  postgres-exporter:
+    image: quay.io/prometheuscommunity/postgres-exporter:v0.16.0
+    container_name: welding-postgres-exporter
+    restart: unless-stopped
+    profiles: ["monitoring"]
+    environment:
+      DATA_SOURCE_NAME: postgresql://${POSTGRES_USER:-welding}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-welding_drift}?sslmode=disable
+    ports:
+      - "${POSTGRES_EXPORTER_PORT:-9187}:9187"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - welding-net
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    container_name: welding-cadvisor
+    restart: unless-stopped
+    profiles: ["monitoring"]
+    ports:
+      - "${CADVISOR_PORT:-8088}:8080"
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker:/var/lib/docker:ro
+    networks:
+      - welding-net
+
+  node-exporter:
+    image: prom/node-exporter:v1.8.2
+    container_name: welding-node-exporter
+    restart: unless-stopped
+    profiles: ["monitoring"]
+    command:
+      - "--path.rootfs=/host"
+    ports:
+      - "${NODE_EXPORTER_PORT:-9100}:9100"
+    volumes:
+      - /:/host:ro
+    networks:
+      - welding-net
+
 volumes:
   zk-data:
   zk-log:
   kafka-data:
   postgres-data:
   spark-events:
+  prometheus-data:
+  grafana-data:
 
 networks:
   welding-net:

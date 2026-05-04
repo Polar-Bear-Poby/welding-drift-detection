@@ -177,10 +177,12 @@ def welding_weekly_drift_trend_dag():
                          OR REGR_SLOPE(avg_cpd_score,
                             EXTRACT(EPOCH FROM report_date::timestamp)) > 0)
                                                                     AS long_term_drift,
-                        -- pass 비율
+                        -- 정상 비율: daily_report.pass_count = IN('PASS','normal') 집계
+                        -- (welding_daily_quality_report fix와 연동)
                         CASE WHEN SUM(total_products) > 0
                              THEN SUM(pass_count)::float / SUM(total_products)
                              ELSE NULL END                          AS pass_rate,
+
                         NOW()                                       AS generated_at
                     FROM welding.daily_report
                     WHERE report_date BETWEEN %s AND %s

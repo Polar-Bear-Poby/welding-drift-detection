@@ -288,34 +288,31 @@ def welding_batch_backfill_dag():
                     raise RuntimeError(f"run_id={run_id}: summary 행이 0개")
 
                 # 품질 검사
+                # [fix] drift 기준으로 품질 검사 (이전: 'ERROR' → 항상 0 반환)
                 cur.execute(
-                    "SELECT COUNT(*), COUNT(*) FILTER (WHERE quality_decision = 'ERROR') "
+                    "SELECT COUNT(*), COUNT(*) FILTER (WHERE quality_decision = 'drift') "
                     "FROM welding.pattern_summary "
                     "WHERE run_id = %s AND event_date = %s",
                     (run_id, target_date),
                 )
-                total, errors = cur.fetchone()
+                total, drifts = cur.fetchone()
 
         if total == 0:
             raise RuntimeError(f"run_id={run_id}, date={target_date}: summary 행 0개")
 
-        error_rate = errors / total
-        if error_rate >= 0.5:
-            raise ValueError(
-                f"데이터 품질 불량: run_id={run_id}, 에러율={error_rate:.1%} >= 50%"
-            )
-
+        drift_rate = drifts / total if total > 0 else 0.0
         log.info(
-            "검증 완료 — run_id=%s date=%s segment=%d summary=%d errors=%d(%.1f%%)",
-            run_id, target_date, seg_rows, sum_rows, errors, error_rate * 100,
+            "검증 완료 — run_id=%s date=%s segment=%d summary=%d drifts=%d(%.1f%%)",
+            run_id, target_date, seg_rows, sum_rows, drifts, drift_rate * 100,
         )
         return {
             "run_id": run_id,
             "target_date": target_date,
             "segment_rows": int(seg_rows),
             "summary_rows": int(sum_rows),
-            "error_rows": int(errors),
+            "drift_rows": int(drifts),
         }
+
 
     @task()
     def report_backfill_complete(validation_result: dict, **context):

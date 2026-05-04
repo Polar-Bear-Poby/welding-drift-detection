@@ -2,6 +2,24 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ENV_FILE="${ENV_FILE:-${ROOT_DIR}/.env}"
+
+load_env_file() {
+  local env_file="$1"
+  if [[ ! -f "${env_file}" ]]; then
+    return 0
+  fi
+  set -a
+  # shellcheck disable=SC1090
+  source <(
+    sed 's/\r$//' "${env_file}" \
+      | grep -v '^[[:space:]]*#' \
+      | grep -v '^[[:space:]]*$'
+  )
+  set +a
+}
+
+load_env_file "${ENV_FILE}"
 
 HOST_DATA_DIR="${HOST_DATA_DIR:-${ROOT_DIR}/data}"
 HOST_STORAGE_DIR="${HOST_STORAGE_DIR:-${ROOT_DIR}/storage}"
@@ -24,10 +42,6 @@ POSTGRES_CONTAINER="${POSTGRES_CONTAINER:-welding-postgres}"
 POSTGRES_DB="${POSTGRES_DB:-welding_drift}"
 POSTGRES_USER="${POSTGRES_USER:-welding}"
 POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-}"
-if [[ -z "${POSTGRES_PASSWORD}" ]]; then
-  echo "ERROR: POSTGRES_PASSWORD must be set" >&2
-  exit 1
-fi
 
 DAG_IDS="${DAG_IDS:-welding_batch_ingest,welding_daily_quality_report,welding_streaming_monitor}"
 DAG_LOOKBACK_DAYS="${DAG_LOOKBACK_DAYS:-30}"
@@ -86,6 +100,17 @@ runtime_ready() {
 }
 
 require_cmd docker
+
+if [[ -z "${POSTGRES_PASSWORD}" ]]; then
+  POSTGRES_PASSWORD="$(
+    docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "${POSTGRES_CONTAINER}" 2>/dev/null \
+      | awk -F= '$1=="POSTGRES_PASSWORD"{print $2; exit}'
+  )"
+fi
+if [[ -z "${POSTGRES_PASSWORD}" ]]; then
+  echo "ERROR: POSTGRES_PASSWORD must be set (env/.env/container env)." >&2
+  exit 1
+fi
 
 csv_to_sql_in_list() {
   local csv="$1"

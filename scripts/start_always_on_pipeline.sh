@@ -105,11 +105,11 @@ docker exec "${SPARK_MASTER_CONTAINER}" bash -lc \
    for consumer_id in \$(seq 1 ${CONSUMER_COUNT}); do
      if [ \$((consumer_id % 2)) -eq 1 ]; then
        topic='${TOPIC_RAW_LASER_A}';
-       channel='1';
+        channel='laser_a';
        group_id='welding-stream-laser-a';
      else
        topic='${TOPIC_RAW_LASER_B}';
-       channel='0';
+        channel='laser_b';
        group_id='welding-stream-laser-b';
      fi;
      rm -rf \"/tmp/spark-checkpoints-consumer-\${consumer_id}\";

@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ENV_FILE="${ENV_FILE:-${ROOT_DIR}/.env}"
 METRICS_DIR="${ROOT_DIR}/storage/metrics/p1c1"
 SUMMARY_CSV="${METRICS_DIR}/line_scale_c2_summary.csv"
 
@@ -12,8 +13,31 @@ REPLAY_SPEED="${REPLAY_SPEED:-300}"
 DATE_FOLDER="${DATE_FOLDER:-20220417}"
 POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-}"
 
+load_env_file() {
+  local env_file="$1"
+  if [[ ! -f "${env_file}" ]]; then
+    return 0
+  fi
+  set -a
+  # shellcheck disable=SC1090
+  source <(
+    sed 's/\r$//' "${env_file}" \
+      | grep -v '^[[:space:]]*#' \
+      | grep -v '^[[:space:]]*$'
+  )
+  set +a
+}
+
+load_env_file "${ENV_FILE}"
+POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-}"
+if [[ -z "${POSTGRES_PASSWORD}" ]] && command -v docker >/dev/null 2>&1; then
+  POSTGRES_PASSWORD="$(
+    docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' welding-postgres 2>/dev/null \
+      | awk -F= '$1=="POSTGRES_PASSWORD"{print $2; exit}'
+  )"
+fi
 if [[ -z "${POSTGRES_PASSWORD}" ]]; then
-  echo "ERROR: POSTGRES_PASSWORD must be set" >&2
+  echo "ERROR: POSTGRES_PASSWORD must be set (env/.env/container env)." >&2
   exit 1
 fi
 

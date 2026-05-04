@@ -119,9 +119,12 @@ def welding_daily_report_dag():
                     )
                     WITH today AS (
                         SELECT event_date, line_id, channel, COUNT(*) as total,
-                               COUNT(*) FILTER (WHERE quality_decision = 'PASS')   as pass,
-                               COUNT(*) FILTER (WHERE quality_decision = 'REVIEW') as review,
-                               COUNT(*) FILTER (WHERE quality_decision = 'ERROR')  as error,
+                               -- [fix] 정상: 배치 'normal' + 스트리밍 레거시 'PASS' 모두 포함
+                               COUNT(*) FILTER (WHERE quality_decision IN ('PASS', 'normal')) as pass,
+                               -- review 개념 없음, 0으로 고정
+                               0                                                              as review,
+                               -- [fix] drift: 새 체계 'drift' 값만
+                               COUNT(*) FILTER (WHERE quality_decision = 'drift')             as error,
                                AVG(cpd_score) as avg_cpd, MAX(cpd_score) as max_cpd
                         FROM welding.pattern_summary
                         WHERE event_date = %s
@@ -142,6 +145,7 @@ def welding_daily_report_dag():
                     """,
                     (target_date, target_date),
                 )
+
                 cur.execute(
                     "SELECT COUNT(*) FROM welding.daily_report WHERE report_date = %s",
                     (target_date,),
