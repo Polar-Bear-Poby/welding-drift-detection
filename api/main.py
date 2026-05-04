@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from fastapi import FastAPI
 
+from api.routes.experiment import router as experiment_router
 from api.routes.health import router as health_router
 from api.routes.inference import router as inference_router
 from api.routes.quality import router as quality_router
@@ -17,4 +18,5 @@ app.include_router(health_router)
 app.include_router(quality_router)
 app.include_router(runs_router)
 app.include_router(inference_router)
+app.include_router(experiment_router)
 

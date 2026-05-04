@@ -65,11 +65,12 @@ INFERENCE_DELAY_MS_LASER_A="${INFERENCE_DELAY_MS_LASER_A:-0}"
 INFERENCE_DELAY_MS_LASER_B="${INFERENCE_DELAY_MS_LASER_B:-0}"
 
 STOP_ALWAYS_ON_PRODUCER="${STOP_ALWAYS_ON_PRODUCER:-1}"
-RESTORE_ALWAYS_ON_PRODUCER="${RESTORE_ALWAYS_ON_PRODUCER:-1}"
-RESTORE_DEFAULT_STREAMING="${RESTORE_DEFAULT_STREAMING:-1}"
+RESTORE_ALWAYS_ON_PRODUCER="${RESTORE_ALWAYS_ON_PRODUCER:-0}"
+RESTORE_DEFAULT_STREAMING="${RESTORE_DEFAULT_STREAMING:-0}"
 TOPIC_RAW_LASER_A="${TOPIC_RAW_LASER_A:-welding.raw.laser_a.v1}"
 TOPIC_RAW_LASER_B="${TOPIC_RAW_LASER_B:-welding.raw.laser_b.v1}"
 DOWN_AFTER_RUN="${DOWN_AFTER_RUN:-0}"
+STOP_RUNTIME_AFTER_RUN="${STOP_RUNTIME_AFTER_RUN:-0}"
 
 METRICS_DIR="${HOST_STORAGE_DIR}/metrics/p1c1"
 SUMMARY_TXT="${METRICS_DIR}/p1c1_timing_${RUN_TAG}.txt"
@@ -80,10 +81,12 @@ producer_was_running=0
 usage() {
   cat <<'EOF'
 Usage:
-  bash scripts/measure_p1_c1_stream_timing.sh [--down-after-run] [--help]
+  bash scripts/measure_p1_c1_stream_timing.sh [--down-after-run] [--stop-runtime-after-run] [--help]
 
 Options:
   --down-after-run   Stop Airflow and all docker compose containers after run.
+  --stop-runtime-after-run
+                    Stop producer/broker/consumer runtime only after run.
   --help             Show this help message.
 EOF
 }
@@ -93,6 +96,10 @@ parse_args() {
     case "$1" in
       --down-after-run)
         DOWN_AFTER_RUN=1
+        shift
+        ;;
+      --stop-runtime-after-run)
+        STOP_RUNTIME_AFTER_RUN=1
         shift
         ;;
       -h|--help)
@@ -255,6 +262,10 @@ restore_default_streaming_if_needed() {
 cleanup() {
   local exit_code="${1:-0}"
   stop_all_streaming_consumers
+  if [[ "${STOP_RUNTIME_AFTER_RUN}" == "1" ]]; then
+    log "STOP_RUNTIME_AFTER_RUN=1 -> stopping producer/broker/consumer runtime containers."
+    (cd "${ROOT_DIR}" && bash scripts/stop_experiment_runtime.sh >/dev/null 2>&1) || true
+  fi
   if [[ "${DOWN_AFTER_RUN}" == "1" ]]; then
     log "DOWN_AFTER_RUN=1 -> stopping Airflow and all project containers."
     (cd "${ROOT_DIR}" && docker compose down --remove-orphans >/dev/null 2>&1) || true
@@ -297,6 +308,20 @@ fi
 if (( PRODUCER_COUNT > 1 )) && (( LINE_COUNT != PRODUCER_COUNT )); then
   log "LINE_COUNT(${LINE_COUNT}) adjusted to PRODUCER_COUNT(${PRODUCER_COUNT}) for 1 producer = 1 line mode."
   LINE_COUNT="${PRODUCER_COUNT}"
+fi
+
+if [[ ! -d "${HOST_DATA_DIR}/${DATE_FOLDER}" ]]; then
+  if [[ -d "${ROOT_DIR}/data/${DATE_FOLDER}" ]]; then
+    HOST_DATA_DIR="${ROOT_DIR}/data"
+  elif [[ -d "/mnt/d/metacode_battery_drfit/welding-kafka-submission/data/${DATE_FOLDER}" ]]; then
+    HOST_DATA_DIR="/mnt/d/metacode_battery_drfit/welding-kafka-submission/data"
+  elif [[ -d "/d/metacode_battery_drfit/welding-kafka-submission/data/${DATE_FOLDER}" ]]; then
+    HOST_DATA_DIR="/d/metacode_battery_drfit/welding-kafka-submission/data"
+  elif [[ -d "/mnt/d/metacode_battery_drfit/data_runtime_by_channel/${DATE_FOLDER}" ]]; then
+    HOST_DATA_DIR="/mnt/d/metacode_battery_drfit/data_runtime_by_channel"
+  elif [[ -d "/d/metacode_battery_drfit/data_runtime_by_channel/${DATE_FOLDER}" ]]; then
+    HOST_DATA_DIR="/d/metacode_battery_drfit/data_runtime_by_channel"
+  fi
 fi
 
 if [[ ! -d "${HOST_DATA_DIR}/${DATE_FOLDER}" ]]; then
