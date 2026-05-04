@@ -88,6 +88,11 @@ def _run_sh(cmd: list[str], env: dict[str, str] | None = None, timeout: int = 12
     """bash 스크립트를 실행하고 StepResult로 반환합니다."""
     import os
     run_env = os.environ.copy()
+    
+    # Windows Git Bash(MSYS)가 '/data' 같은 Docker 내부 경로를 
+    # 'C:/Program Files/Git/data' 로 멋대로 변환하는 것을 방지
+    run_env["MSYS_NO_PATHCONV"] = "1"
+    
     if env:
         run_env.update(env)
 

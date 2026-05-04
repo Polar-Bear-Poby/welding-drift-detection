@@ -36,22 +36,36 @@ if page == "Overview":
         "1 row = 1 battery process (laser_a or laser_b). "
         "quality_decision is determined by cpd_score proxy over 16 equal segments."
     )
-    try:
-        latest = api_get("/api/v1/quality/latest", params={"limit": 100})
-        if latest:
-            total = len(latest)
-            # quality_decision: "drift" | "normal"
-            drift_count = sum(1 for r in latest if r["quality_decision"] == "drift")
-            normal_count = total - drift_count
-            col1, col2, col3 = st.columns(3)
-            col1.metric("Total (latest 100)", total)
-            col2.metric("Normal", normal_count)
-            col3.metric("Drift", drift_count, delta=f"{drift_count/total*100:.1f}%" if total else "0%")
-            st.dataframe(latest[:30], use_container_width=True)
-        else:
-            st.info("No recent rows.")
-    except Exception as exc:
-        st.error(f"Failed to load overview: {exc}")
+
+    col_btn, col_auto = st.columns([2, 8])
+    with col_btn:
+        if st.button("🔄 Refresh Now"):
+            pass  # 버튼을 누르면 전체 페이지가 rerun 되므로 pass만 해도 새로고침됨
+    with col_auto:
+        auto_refresh = st.checkbox("Auto-refresh (every 5 seconds)", value=True)
+
+    @st.fragment(run_every=5 if auto_refresh else None)
+    def render_overview_data():
+        try:
+            latest = api_get("/api/v1/quality/latest", params={"limit": 100})
+            if latest:
+                total = len(latest)
+                # quality_decision: "drift" | "normal"
+                drift_count = sum(1 for r in latest if r["quality_decision"] == "drift")
+                normal_count = total - drift_count
+                
+                col1, col2, col3 = st.columns(3)
+                col1.metric("Total (latest 100)", total)
+                col2.metric("Normal", normal_count)
+                col3.metric("Drift", drift_count, delta=f"{drift_count/total*100:.1f}%" if total else "0%")
+                
+                st.dataframe(latest[:30], use_container_width=True)
+            else:
+                st.info("No recent rows.")
+        except Exception as exc:
+            st.error(f"Failed to load overview: {exc}")
+
+    render_overview_data()
 
 elif page == "Quality History":
     st.subheader("Quality History")
