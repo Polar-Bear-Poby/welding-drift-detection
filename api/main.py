@@ -2,21 +2,17 @@ from __future__ import annotations
 
 from fastapi import FastAPI
 
-from api.routes.experiment import router as experiment_router
-from api.routes.health import router as health_router
-from api.routes.inference import router as inference_router
-from api.routes.quality import router as quality_router
-from api.routes.runs import router as runs_router
+from api.routes.realtime import router as realtime_router
 
 app = FastAPI(
-    title="Welding Drift API",
-    version="0.1.0",
-    description="API for welding quality history and rule-based inference demo.",
+    title="Welding Drift API (New Experiment Environment)",
+    version="1.0.0",
+    description=(
+        "API for real-time welding drift detection experiment (new_src).\n\n"
+        "This version is optimized for the CSV-based FileWatcher pipeline and does not require PostgreSQL."
+    ),
 )
 
-app.include_router(health_router)
-app.include_router(quality_router)
-app.include_router(runs_router)
-app.include_router(inference_router)
-app.include_router(experiment_router)
+# New experiment environment router (CSV-based, no PostgreSQL required)
+app.include_router(realtime_router)
 

@@ -3,6 +3,12 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_FILE="${ENV_FILE:-${ROOT_DIR}/.env}"
+ENV_UTILS="${ROOT_DIR}/scripts/lib/env_utils.sh"
+
+if [[ -f "${ENV_UTILS}" ]]; then
+  # shellcheck disable=SC1090
+  source "${ENV_UTILS}"
+fi
 METRICS_DIR="${ROOT_DIR}/storage/metrics/p1c1"
 SUMMARY_CSV="${METRICS_DIR}/line_scale_c2_summary.csv"
 
@@ -12,34 +18,57 @@ CONSUMER_COUNT="${CONSUMER_COUNT:-2}"
 REPLAY_SPEED="${REPLAY_SPEED:-300}"
 DATE_FOLDER="${DATE_FOLDER:-20220417}"
 POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-}"
+OPEN_UI_FIRST_RUN="${OPEN_UI_FIRST_RUN:-1}"
+EXPERIMENT_MODE="${EXPERIMENT_MODE:-0}"
 
 load_env_file() {
-  local env_file="$1"
-  if [[ ! -f "${env_file}" ]]; then
-    return 0
+  if declare -F load_env_file_without_override >/dev/null 2>&1; then
+    load_env_file_without_override "$1"
+    return
   fi
-  set -a
-  # shellcheck disable=SC1090
-  source <(
-    sed 's/\r$//' "${env_file}" \
-      | grep -v '^[[:space:]]*#' \
-      | grep -v '^[[:space:]]*$'
-  )
-  set +a
 }
 
 load_env_file "${ENV_FILE}"
 POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-}"
-if [[ -z "${POSTGRES_PASSWORD}" ]] && command -v docker >/dev/null 2>&1; then
-  POSTGRES_PASSWORD="$(
-    docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' welding-postgres 2>/dev/null \
-      | awk -F= '$1=="POSTGRES_PASSWORD"{print $2; exit}'
-  )"
+if declare -F ensure_postgres_password >/dev/null 2>&1; then
+  ensure_postgres_password "${ENV_FILE}" "welding-postgres" "welding_local_auto_pw"
 fi
+POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-}"
 if [[ -z "${POSTGRES_PASSWORD}" ]]; then
-  echo "ERROR: POSTGRES_PASSWORD must be set (env/.env/container env)." >&2
+  echo "ERROR: POSTGRES_PASSWORD could not be resolved." >&2
   exit 1
 fi
+
+usage() {
+  cat <<'EOF'
+Usage:
+  bash scripts/run_line_scale_consumers2.sh [--experimental] [--help]
+
+Options:
+  --experimental   Allow replay/re-ingest of already processed DATE_FOLDER during this experiment batch.
+  --help           Show this help message.
+EOF
+}
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --experimental)
+        EXPERIMENT_MODE=1
+        shift
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        echo "ERROR: unknown argument: $1" >&2
+        usage
+        exit 1
+        ;;
+    esac
+  done
+}
 
 mkdir -p "${METRICS_DIR}"
 if [[ ! -f "${SUMMARY_CSV}" ]]; then
@@ -70,6 +99,7 @@ run_one() {
     DATE_FOLDER="${DATE_FOLDER}" \
     RUN_TAG="${run_tag}" \
     POSTGRES_PASSWORD="${POSTGRES_PASSWORD}" \
+    EXPERIMENT_MODE="${EXPERIMENT_MODE}" \
     bash scripts/measure_p1_c1_stream_timing.sh
   )
 
@@ -108,10 +138,17 @@ run_one() {
 }
 
 IFS=',' read -r -a lines <<< "${LINE_SET}"
+parse_args "$@"
+is_first_run=1
 for line_count in "${lines[@]}"; do
   line_count="$(echo "${line_count}" | xargs)"
   [[ -n "${line_count}" ]] || continue
-  run_one "${line_count}"
+  if [[ "${OPEN_UI_FIRST_RUN}" == "1" && "${is_first_run}" == "1" ]]; then
+    OPEN_UI=1 run_one "${line_count}"
+  else
+    OPEN_UI=0 run_one "${line_count}"
+  fi
+  is_first_run=0
 done
 
 echo "Completed. Summary: ${SUMMARY_CSV}"

@@ -64,6 +64,25 @@ cp .env.example .env
 ```
 `.env` 파일에 로컬 데이터 경로(`DATA_DIR`, `STORAGE_DIR`) 및 DB 비밀번호를 설정합니다.
 
+권장 `.env` 추가 값:
+```env
+AIRFLOW_API_SECRET_KEY=welding-airflow-api-secret-key
+AIRFLOW_WEBSERVER_SECRET_KEY=welding-airflow-webserver-secret-key
+SPARK_BATCH_OUTPUT_DIR=/spark-out/spark_batch
+BACKFILL_STORAGE_DIR=/spark-out/spark_batch
+SPARK_INTERMEDIATE_ROOTS=/spark-out/intermediate,/spark-out/spark_batch/intermediate
+```
+
+실험 전 권한/경로 준비(특히 Linux/EC2):
+```bash
+mkdir -p "$STORAGE_DIR"
+chmod -R 775 "$STORAGE_DIR"
+```
+
+참고:
+- Spark Parquet 출력은 Docker named volume(`/spark-out`)를 기본 사용합니다. (Windows bind-mount chmod 이슈 회피)
+- 호스트 bind-mount 경로(`/storage`)는 로그/메트릭 용도로 계속 사용합니다.
+
 ### 3.2. 인프라 실행 (Docker Compose)
 Kafka, Spark, PostgreSQL 등 기반 시스템을 컨테이너로 띄웁니다.
 ```bash
@@ -87,6 +106,18 @@ uv run python spark_batch.py --input-dir /data --output-dir /storage/spark_batch
 - **Backend API (FastAPI)**: http://localhost:8001/docs
 - **Kafka UI**: http://localhost:8089
 - **Spark Master UI**: http://localhost:18080
+- **Airflow UI**: http://localhost:8080
+
+### 3.5. Airflow 로그인 500(Internal Server Error) 복구
+Airflow 업그레이드 직후 기존 세션 데이터 직렬화 포맷 충돌로 로그인 500이 발생할 수 있습니다.
+
+복구 순서:
+```bash
+docker exec -i welding-postgres psql -U welding -d welding_drift -c "TRUNCATE TABLE welding.session;"
+docker compose restart airflow-webserver airflow-scheduler airflow-dag-processor airflow-triggerer
+```
+
+브라우저에서 `localhost:8080` 쿠키/사이트 데이터 삭제 후 다시 접속하세요.
 
 ## 4. 각 컴포넌트 설명
 

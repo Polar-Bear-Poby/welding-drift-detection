@@ -67,7 +67,7 @@ load_env_file()
 
 
 LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-logging.basicConfig(level=logging.INFO, format=LOG_FORMAT, datefmt="%H:%M:%S")
+logging.basicConfig(level=logging.INFO, format=LOG_FORMAT, datefmt="%H:%M:%S", stream=sys.stdout)
 logger = logging.getLogger("welding.producer")
 
 
@@ -275,6 +275,50 @@ def is_channel_pair_aligned(record: ProductRecord) -> bool:
     return True
 
 
+def record_battery_id(record: ProductRecord) -> str | None:
+    """Extract battery id from any paired channel file in this record."""
+    for lead_num in paired_leads(record):
+        file_b = record.files[0].get(lead_num)
+        file_a = record.files[1].get(lead_num)
+        battery_b = extract_battery_id(file_b)
+        battery_a = extract_battery_id(file_a)
+        if battery_b and battery_a and battery_b == battery_a:
+            return battery_a
+        if battery_a:
+            return battery_a
+        if battery_b:
+            return battery_b
+    return None
+
+
+def load_paired_battery_ids(index_json_path: str) -> list[str]:
+    """Load battery ids from generated paired-battery index json."""
+    path = Path(index_json_path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+
+    ids = payload.get("common_battery_ids")
+    if isinstance(ids, list):
+        normalized = sorted({str(int(x)) for x in ids})
+        if normalized:
+            return normalized
+
+    entries = payload.get("entries")
+    if isinstance(entries, list):
+        extracted: list[str] = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            battery_id = entry.get("battery_id")
+            if battery_id is None:
+                continue
+            extracted.append(str(int(str(battery_id))))
+        normalized = sorted(set(extracted))
+        if normalized:
+            return normalized
+
+    raise ValueError(f"No battery ids found in index json: {index_json_path}")
+
+
 def scan_data_dir(data_dir: str) -> list[ProductRecord]:
     """Scan CSV files and group them into line/product instances."""
     root = Path(data_dir)
@@ -414,6 +458,7 @@ def make_message(
     chunk_size: int | None = None,
     chunk_start: int | None = None,
     chunk_end: int | None = None,
+    ingest_run_id: str | None = None,
 ) -> dict:
     if chunk_start is None:
         if chunk_size is None:
@@ -458,6 +503,7 @@ def make_message(
         "metadata": {
             "source": "file_replay_producer",
             "version": PRODUCER_VERSION,
+            "ingest_run_id": (ingest_run_id or "").strip() or None,
             "file_name": prefixed_file_name,
             "original_product_instance_id": item.original_product_instance_id
             or item.record.product_instance_id,
@@ -664,6 +710,7 @@ def publish_product(
     target_chunk_bytes: int | None,
     speed: float,
     require_channel_pair: bool = True,
+    ingest_run_id: str | None = None,
 ) -> int:
     """Publish all available leads/channels for one product instance."""
     sent = 0
@@ -733,6 +780,7 @@ def publish_product(
                     total_chunks=total_chunks,
                     chunk_start=chunk_start,
                     chunk_end=chunk_end,
+                    ingest_run_id=ingest_run_id,
                 )
                 target_topic = topic_by_channel[channel]
                 producer.send(target_topic, key=partition_key, value=message).add_callback(
@@ -769,6 +817,28 @@ def run(args: argparse.Namespace) -> int:
         filtered = before - len(records)
         logger.info(
             "Paired-channel guard enabled. kept=%s filtered=%s",
+            len(records),
+            filtered,
+        )
+
+    if args.paired_battery_index_json:
+        paired_battery_ids = load_paired_battery_ids(args.paired_battery_index_json)
+        if args.sample_battery_count and args.sample_battery_count > 0:
+            sample_size = min(args.sample_battery_count, len(paired_battery_ids))
+            rng = random.Random(args.sample_battery_seed)
+            paired_battery_ids = sorted(rng.sample(paired_battery_ids, sample_size), key=int)
+        paired_battery_id_set = set(paired_battery_ids)
+
+        before = len(records)
+        records = [
+            record
+            for record in records
+            if (record_battery_id(record) in paired_battery_id_set)
+        ]
+        filtered = before - len(records)
+        logger.info(
+            "Paired battery index filter enabled. selected_batteries=%s kept_records=%s filtered_records=%s",
+            len(paired_battery_id_set),
             len(records),
             filtered,
         )
@@ -879,6 +949,7 @@ def run(args: argparse.Namespace) -> int:
                     target_chunk_bytes=args.target_chunk_bytes,
                     speed=args.speed,
                     require_channel_pair=args.require_channel_pair,
+                    ingest_run_id=args.ingest_run_id,
                 )
                 pub_elapsed = time.monotonic() - pub_start
                 total_messages += sent
@@ -1013,6 +1084,23 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         help="Comma-separated random seeds for per-line shuffle, e.g. '1,2,3'",
     )
     parser.add_argument(
+        "--paired-battery-index-json",
+        default=None,
+        help="Path to paired battery index json (common battery ids for laser_a and laser_b).",
+    )
+    parser.add_argument(
+        "--sample-battery-count",
+        type=int,
+        default=0,
+        help="Randomly sample this many battery ids from --paired-battery-index-json (0 disables).",
+    )
+    parser.add_argument(
+        "--sample-battery-seed",
+        type=int,
+        default=42,
+        help="Random seed used with --sample-battery-count.",
+    )
+    parser.add_argument(
         "--line-number",
         type=int,
         default=None,
@@ -1029,6 +1117,11 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         type=int,
         default=1,
         help="Total number of shards for product record partitioning.",
+    )
+    parser.add_argument(
+        "--ingest-run-id",
+        default="",
+        help="Run identifier propagated from Airflow ingest DAG to Kafka message metadata.",
     )
     pair_group = parser.add_mutually_exclusive_group()
     pair_group.add_argument(

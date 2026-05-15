@@ -3,20 +3,18 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_FILE="${ENV_FILE:-${ROOT_DIR}/.env}"
+ENV_UTILS="${ROOT_DIR}/scripts/lib/env_utils.sh"
+
+if [[ -f "${ENV_UTILS}" ]]; then
+  # shellcheck disable=SC1090
+  source "${ENV_UTILS}"
+fi
 
 load_env_file() {
-  local env_file="$1"
-  if [[ ! -f "${env_file}" ]]; then
-    return 0
+  if declare -F load_env_file_without_override >/dev/null 2>&1; then
+    load_env_file_without_override "$1"
+    return
   fi
-  set -a
-  # shellcheck disable=SC1090
-  source <(
-    sed 's/\r$//' "${env_file}" \
-      | grep -v '^[[:space:]]*#' \
-      | grep -v '^[[:space:]]*$'
-  )
-  set +a
 }
 
 load_env_file "${ENV_FILE}"
@@ -30,6 +28,9 @@ LINE_COUNT="${LINE_COUNT:-3}"
 REPLAY_SPEED="${REPLAY_SPEED:-100}"
 POLL_INTERVAL_SEC="${POLL_INTERVAL_SEC:-30}"
 DELETE_PARQUET_AFTER_BATCH="${DELETE_PARQUET_AFTER_BATCH:-1}"
+EXPERIMENT_MODE="${EXPERIMENT_MODE:-0}"
+EXPERIMENT_RESET_STATE="${EXPERIMENT_RESET_STATE:-0}"
+EXPERIMENT_DATE="${EXPERIMENT_DATE:-}"
 
 KAFKA_BOOTSTRAP="${KAFKA_BOOTSTRAP:-kafka:9092}"
 NETWORK_NAME="${NETWORK_NAME:-welding-kafka-submission_welding-net}"
@@ -66,6 +67,18 @@ log() {
   printf '[%s] %s\n' "$(date '+%F %T')" "${msg}" | tee -a "${DAEMON_LOG}"
 }
 
+if [[ "${EXPERIMENT_RESET_STATE}" == "1" ]]; then
+  if [[ -n "${EXPERIMENT_DATE}" ]]; then
+    tmp_file="${STATE_FILE}.tmp.$$"
+    grep -vx "${EXPERIMENT_DATE}" "${STATE_FILE}" > "${tmp_file}" || true
+    mv "${tmp_file}" "${STATE_FILE}"
+    log "EXPERIMENT_MODE reset: removed processed date entry ${EXPERIMENT_DATE}"
+  else
+    : > "${STATE_FILE}"
+    log "EXPERIMENT_MODE reset: cleared all processed date entries"
+  fi
+fi
+
 require_cmd() {
   if ! command -v "$1" >/dev/null 2>&1; then
     echo "ERROR: required command not found: $1" >&2
@@ -101,14 +114,12 @@ runtime_ready() {
 
 require_cmd docker
 
-if [[ -z "${POSTGRES_PASSWORD}" ]]; then
-  POSTGRES_PASSWORD="$(
-    docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "${POSTGRES_CONTAINER}" 2>/dev/null \
-      | awk -F= '$1=="POSTGRES_PASSWORD"{print $2; exit}'
-  )"
+if declare -F ensure_postgres_password >/dev/null 2>&1; then
+  ensure_postgres_password "${ENV_FILE}" "${POSTGRES_CONTAINER}" "welding_local_auto_pw"
 fi
+POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-}"
 if [[ -z "${POSTGRES_PASSWORD}" ]]; then
-  echo "ERROR: POSTGRES_PASSWORD must be set (env/.env/container env)." >&2
+  echo "ERROR: POSTGRES_PASSWORD could not be resolved." >&2
   exit 1
 fi
 

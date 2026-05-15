@@ -48,8 +48,11 @@ DB_CONN_STR = f"host={_PG_HOST} port={_PG_PORT} dbname={_PG_DB} user={_PG_USER} 
 
 # [fix #7] 컨테이너 내부 경로: docker-compose.yml 기준 마운트 경로
 _DATA_DIR_CONTAINER    = os.getenv("BACKFILL_DATA_DIR",    "/data")
-_STORAGE_DIR_CONTAINER = os.getenv("BACKFILL_STORAGE_DIR", "/storage/spark_batch")
+_STORAGE_DIR_CONTAINER = os.getenv("BACKFILL_STORAGE_DIR", "/spark-out/spark_batch")
 _PRODUCER_CONTAINER = os.getenv("PRODUCER_CONTAINER", "welding-producer")
+_PRODUCER_IMAGE = os.getenv("PRODUCER_IMAGE", "welding-kafka-submission-producer:latest")
+_NETWORK_NAME = os.getenv("NETWORK_NAME", "welding-kafka-submission_welding-net")
+_KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "kafka:9092")
 
 
 @dag(
@@ -108,6 +111,29 @@ _PRODUCER_CONTAINER = os.getenv("PRODUCER_CONTAINER", "welding-producer")
     """,
 )
 def welding_batch_backfill_dag():
+    def _get_stage_event_detail(run_id: str, stage_name: str) -> dict:
+        with psycopg2.connect(DB_CONN_STR) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT status, COALESCE(detail_json::text, '{}')
+                    FROM welding.stage_event
+                    WHERE run_id = %s::uuid AND stage_name = %s
+                    """,
+                    (run_id, stage_name),
+                )
+                row = cur.fetchone()
+        if row is None:
+            raise RuntimeError(f"run_id={run_id} stage_event missing: {stage_name}")
+        status, detail_text = row
+        if status != "SUCCESS":
+            raise RuntimeError(
+                f"run_id={run_id} stage_event={stage_name} status={status} (expected SUCCESS)"
+            )
+        try:
+            return json.loads(detail_text or "{}")
+        except Exception:
+            return {"raw": detail_text}
 
     @task()
     def validate_params(**context) -> dict:
@@ -209,14 +235,16 @@ def welding_batch_backfill_dag():
         log.info("%s: 데이터 이미 존재 → 스킵 (force_overwrite=False)", target_date)
 
     # ── [fix #1] run_producer: --data-dir /data/{target_date} ─────────────
-    # docker run + 호스트 절대경로 하드코딩 대신, 기존 producer 컨테이너를 재사용한다.
+    # 6차 정책: producer 실행은 docker exec 대신 docker run --rm로 통일한다.
     run_producer = BashOperator(
         task_id="run_producer",
         bash_command=(
-            f"docker start {_PRODUCER_CONTAINER} >/dev/null 2>&1 || true && "
-            f"docker exec {_PRODUCER_CONTAINER} python /app/producer.py "
+            "docker run --rm "
+            f"--network {_NETWORK_NAME} "
+            f"--volumes-from {_PRODUCER_CONTAINER} "
+            f"{_PRODUCER_IMAGE} "
             "--data-dir /data/{{ params.target_date }} "
-            "--kafka kafka:9092 "
+            f"--kafka {_KAFKA_BOOTSTRAP} "
             "--line-count {{ params.line_count }} "
             "--line-seed \"{{ params.line_seeds }}\" "
             "--speed {{ params.replay_speed }} "
@@ -258,10 +286,8 @@ def welding_batch_backfill_dag():
             raise RuntimeError(f"spark_batch.py 실패: returncode={result.returncode}")
 
     @task(retries=3, retry_delay=timedelta(minutes=2))
-    def validate_results(validated: dict) -> dict:
-        """
-        [fix #6] DAG에서 생성한 run_id로만 검증 — 타 run 혼입 방지.
-        """
+    def validate_run_status(validated: dict) -> dict:
+        """Validate spark_batch_run status for this run_id."""
         run_id      = validated["run_id"]
         target_date = validated["target_date_iso"]
 
@@ -286,32 +312,237 @@ def welding_batch_backfill_dag():
                     raise RuntimeError(f"run_id={run_id}: status={status} (SUCCESS 아님)")
                 if sum_rows == 0:
                     raise RuntimeError(f"run_id={run_id}: summary 행이 0개")
-
-                # 품질 검사
-                # [fix] drift 기준으로 품질 검사 (이전: 'ERROR' → 항상 0 반환)
-                cur.execute(
-                    "SELECT COUNT(*), COUNT(*) FILTER (WHERE quality_decision = 'drift') "
-                    "FROM welding.pattern_summary "
-                    "WHERE run_id = %s AND event_date = %s",
-                    (run_id, target_date),
-                )
-                total, drifts = cur.fetchone()
-
-        if total == 0:
-            raise RuntimeError(f"run_id={run_id}, date={target_date}: summary 행 0개")
-
-        drift_rate = drifts / total if total > 0 else 0.0
-        log.info(
-            "검증 완료 — run_id=%s date=%s segment=%d summary=%d drifts=%d(%.1f%%)",
-            run_id, target_date, seg_rows, sum_rows, drifts, drift_rate * 100,
-        )
         return {
             "run_id": run_id,
             "target_date": target_date,
             "segment_rows": int(seg_rows),
             "summary_rows": int(sum_rows),
-            "drift_rows": int(drifts),
         }
+
+    @task(retries=2, retry_delay=timedelta(minutes=1))
+    def validate_chunk_complete(run_meta: dict) -> dict:
+        run_id = run_meta["run_id"]
+        detail = _get_stage_event_detail(run_id, "chunk_complete")
+        return {**run_meta, "chunk_complete": detail}
+
+    @task(retries=2, retry_delay=timedelta(minutes=1))
+    def validate_segmentation_stage(run_meta: dict) -> dict:
+        run_id = run_meta["run_id"]
+        detail = _get_stage_event_detail(run_id, "segmentation_complete")
+        return {**run_meta, "segmentation_stage": detail}
+
+    @task(retries=2, retry_delay=timedelta(minutes=1))
+    def validate_inference_stage(run_meta: dict) -> dict:
+        run_id = run_meta["run_id"]
+        detail = _get_stage_event_detail(run_id, "inference_complete")
+        return {**run_meta, "inference_stage": detail}
+
+    @task(retries=2, retry_delay=timedelta(minutes=1))
+    def validate_load_stage(run_meta: dict) -> dict:
+        run_id = run_meta["run_id"]
+        detail = _get_stage_event_detail(run_id, "load_complete")
+        return {**run_meta, "load_stage": detail}
+
+    @task(retries=2, retry_delay=timedelta(minutes=1))
+    def validate_reassembly_integrity(run_meta: dict) -> dict:
+        """Validate reassembly integrity only when run-scoped audit rows exist."""
+        run_id = run_meta["run_id"]
+        with psycopg2.connect(DB_CONN_STR) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM information_schema.tables
+                        WHERE table_schema = 'welding'
+                          AND table_name = 'reassembly_audit'
+                    )
+                    """
+                )
+                has_table = bool(cur.fetchone()[0])
+                if not has_table:
+                    return {**run_meta, "reassembly_validation": "skipped_no_table"}
+
+                cur.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM welding.reassembly_audit
+                    WHERE batch_id IN (
+                        SELECT id
+                        FROM welding.spark_batch_run
+                        WHERE run_id = %s::uuid
+                    )
+                    """,
+                    (run_id,),
+                )
+                scoped_rows = int(cur.fetchone()[0] or 0)
+                if scoped_rows == 0:
+                    return {**run_meta, "reassembly_validation": "skipped_no_rows"}
+
+                cur.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM welding.reassembly_audit
+                    WHERE batch_id IN (
+                        SELECT id
+                        FROM welding.spark_batch_run
+                        WHERE run_id = %s::uuid
+                    )
+                    AND reassembly_status IN ('incomplete_chunks', 'mixed_chunk_metadata', 'sample_count_mismatch')
+                    """,
+                    (run_id,),
+                )
+                bad_rows = int(cur.fetchone()[0] or 0)
+        if bad_rows > 0:
+            raise RuntimeError(f"run_id={run_id} reassembly integrity failed: bad_rows={bad_rows}")
+        return {**run_meta, "reassembly_validation": "passed"}
+
+    @task(retries=2, retry_delay=timedelta(minutes=1))
+    def validate_segmentation_coverage(run_meta: dict) -> dict:
+        """Validate per-product/channel segmentation count == 16."""
+        run_id = run_meta["run_id"]
+        with psycopg2.connect(DB_CONN_STR) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    WITH per_key AS (
+                        SELECT product_id, channel, COUNT(*) AS segment_count
+                        FROM welding.pattern_segment
+                        WHERE run_id = %s::uuid
+                        GROUP BY product_id, channel
+                    )
+                    SELECT
+                        COUNT(*) AS key_count,
+                        COUNT(*) FILTER (WHERE segment_count != 16) AS invalid_keys
+                    FROM per_key
+                    """,
+                    (run_id,),
+                )
+                key_count, invalid_keys = cur.fetchone()
+        if (key_count or 0) == 0:
+            raise RuntimeError(f"run_id={run_id} has no pattern_segment rows")
+        if (invalid_keys or 0) > 0:
+            raise RuntimeError(
+                f"run_id={run_id} segmentation coverage failed: invalid_keys={invalid_keys}"
+            )
+        return {**run_meta, "segmentation_keys": int(key_count)}
+
+    @task(retries=2, retry_delay=timedelta(minutes=1))
+    def validate_inference_coverage(run_meta: dict) -> dict:
+        """Validate per-product total 32 segment rows (2 channels x 16 segments)."""
+        run_id = run_meta["run_id"]
+        with psycopg2.connect(DB_CONN_STR) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    WITH per_product AS (
+                        SELECT
+                            product_id,
+                            COUNT(*) AS total_segments,
+                            COUNT(DISTINCT channel) AS channel_count
+                        FROM welding.pattern_segment
+                        WHERE run_id = %s::uuid
+                        GROUP BY product_id
+                    )
+                    SELECT
+                        COUNT(*) AS product_count,
+                        COUNT(*) FILTER (
+                            WHERE total_segments != 32 OR channel_count != 2
+                        ) AS invalid_products
+                    FROM per_product
+                    """,
+                    (run_id,),
+                )
+                product_count, invalid_products = cur.fetchone()
+        if (product_count or 0) == 0:
+            raise RuntimeError(f"run_id={run_id} has no per-product segment rows")
+        if (invalid_products or 0) > 0:
+            raise RuntimeError(
+                f"run_id={run_id} inference coverage failed: invalid_products={invalid_products}"
+            )
+        return {**run_meta, "inference_products": int(product_count)}
+
+    @task(retries=2, retry_delay=timedelta(minutes=1))
+    def validate_summary_completeness(run_meta: dict) -> dict:
+        """Validate per-product summary has both channels (2 rows)."""
+        run_id = run_meta["run_id"]
+        with psycopg2.connect(DB_CONN_STR) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    WITH per_product AS (
+                        SELECT
+                            product_id,
+                            COUNT(*) AS summary_rows,
+                            COUNT(DISTINCT channel) AS channel_count
+                        FROM welding.pattern_summary
+                        WHERE run_id = %s::uuid
+                        GROUP BY product_id
+                    )
+                    SELECT
+                        COUNT(*) AS product_count,
+                        COUNT(*) FILTER (
+                            WHERE summary_rows != 2 OR channel_count != 2
+                        ) AS invalid_products
+                    FROM per_product
+                    """,
+                    (run_id,),
+                )
+                product_count, invalid_products = cur.fetchone()
+        if (product_count or 0) == 0:
+            raise RuntimeError(f"run_id={run_id} has no pattern_summary rows")
+        if (invalid_products or 0) > 0:
+            raise RuntimeError(
+                f"run_id={run_id} summary completeness failed: invalid_products={invalid_products}"
+            )
+        return {**run_meta, "summary_products": int(product_count)}
+
+    @task(retries=2, retry_delay=timedelta(minutes=1))
+    def validate_business_rule(run_meta: dict) -> dict:
+        """Validate summary decision is consistent with segment drift aggregation."""
+        run_id = run_meta["run_id"]
+        with psycopg2.connect(DB_CONN_STR) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    WITH seg AS (
+                        SELECT
+                            run_id, source_file, channel,
+                            BOOL_OR(segment_drift_flag) AS expected_is_drift
+                        FROM welding.pattern_segment
+                        WHERE run_id = %s::uuid
+                        GROUP BY run_id, source_file, channel
+                    )
+                    SELECT
+                        COUNT(*) FILTER (WHERE s.quality_decision NOT IN ('normal', 'drift')) AS invalid_rows,
+                        COUNT(*) FILTER (
+                            WHERE (
+                                seg.expected_is_drift AND s.quality_decision <> 'drift'
+                            ) OR (
+                                NOT seg.expected_is_drift AND s.quality_decision <> 'normal'
+                            )
+                        ) AS inconsistent_rows,
+                        COUNT(*) FILTER (WHERE s.quality_decision = 'drift') AS drift_rows,
+                        COUNT(*) AS total_rows
+                    FROM welding.pattern_summary s
+                    JOIN seg
+                      ON seg.run_id = s.run_id
+                     AND seg.source_file = s.source_file
+                     AND seg.channel = s.channel
+                    WHERE s.run_id = %s::uuid
+                    """,
+                    (run_id, run_id),
+                )
+                invalid_rows, inconsistent_rows, drift_rows, total_rows = cur.fetchone()
+        if (invalid_rows or 0) > 0:
+            raise RuntimeError(
+                f"run_id={run_id} business rule failed: invalid quality_decision rows={invalid_rows}"
+            )
+        if (inconsistent_rows or 0) > 0:
+            raise RuntimeError(
+                f"run_id={run_id} business rule failed: inconsistent_rows={inconsistent_rows}"
+            )
+        return {**run_meta, "drift_rows": int(drift_rows or 0), "summary_rows": int(total_rows or 0)}
 
 
     @task()
@@ -348,8 +579,17 @@ def welding_batch_backfill_dag():
 
     # producer 이후 공통 흐름: spark_batch에 validated(run_id 포함) 전달
     batch = run_spark_batch(validated)
-    validation = validate_results(validated)
-    run_producer >> batch >> validation >> report_backfill_complete(validation)
+    run_status = validate_run_status(validated)
+    chunk_ok = validate_chunk_complete(run_status)
+    stage_seg_ok = validate_segmentation_stage(chunk_ok)
+    stage_inf_ok = validate_inference_stage(stage_seg_ok)
+    stage_load_ok = validate_load_stage(stage_inf_ok)
+    reassembly_ok = validate_reassembly_integrity(stage_load_ok)
+    segmentation_ok = validate_segmentation_coverage(reassembly_ok)
+    inference_ok = validate_inference_coverage(segmentation_ok)
+    summary_ok = validate_summary_completeness(inference_ok)
+    validation = validate_business_rule(summary_ok)
+    run_producer >> batch >> run_status >> chunk_ok >> stage_seg_ok >> stage_inf_ok >> stage_load_ok >> reassembly_ok >> segmentation_ok >> inference_ok >> summary_ok >> validation >> report_backfill_complete(validation)
 
 
 welding_batch_backfill_dag()

@@ -1,5 +1,5 @@
 # Airflow 3 Production-ready Image
-FROM apache/airflow:3.0.1
+FROM apache/airflow:3.1.8
 
 USER root
 # uv 설치
@@ -16,6 +16,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # 패키지 설치 (Root 권한으로 시스템 영역에 설치)
 # Airflow 3에서는 FAB 및 Standard Provider가 분리되어 명시적 설치가 권장됩니다.
 RUN uv pip install --system \
+    --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-3.1.8/constraints-3.12.txt" \
+    "apache-airflow==3.1.8" \
     psycopg2-binary \
     apache-airflow-providers-apache-spark \
     apache-airflow-providers-postgres \

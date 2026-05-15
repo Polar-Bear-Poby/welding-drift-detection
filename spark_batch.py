@@ -10,6 +10,7 @@ PostgreSQL).
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import math
 import os
@@ -46,6 +47,21 @@ TRAILING_SUFFIX_RE = re.compile(r"_(?:CH[01]|laser_[ab]|L[AB])$", re.IGNORECASE)
 LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 logging.basicConfig(level=logging.INFO, format=LOG_FORMAT, datefmt="%H:%M:%S")
 logger = logging.getLogger("welding.spark_batch")
+
+SEGMENT_MODEL_NAME_LASER_A = os.getenv("SEGMENT_MODEL_NAME_LASER_A", "laser_a_drift_model")
+SEGMENT_MODEL_NAME_LASER_B = os.getenv("SEGMENT_MODEL_NAME_LASER_B", "laser_b_drift_model")
+SEGMENT_MODEL_VERSION_LASER_A = os.getenv("SEGMENT_MODEL_VERSION_LASER_A", "v1")
+SEGMENT_MODEL_VERSION_LASER_B = os.getenv("SEGMENT_MODEL_VERSION_LASER_B", "v1")
+SEGMENT_DRIFT_THRESHOLD_LASER_A = float(os.getenv("SEGMENT_DRIFT_THRESHOLD_LASER_A", "0.62"))
+SEGMENT_DRIFT_THRESHOLD_LASER_B = float(os.getenv("SEGMENT_DRIFT_THRESHOLD_LASER_B", "0.58"))
+SEGMENT_INFERENCE_MS_LASER_A = int(os.getenv("SEGMENT_INFERENCE_MS_LASER_A", "14"))
+SEGMENT_INFERENCE_MS_LASER_B = int(os.getenv("SEGMENT_INFERENCE_MS_LASER_B", "19"))
+SPARK_PARQUET_STRICT = os.getenv("SPARK_PARQUET_STRICT", "0").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 
 def setup_file_logger(output_dir: str) -> None:
@@ -208,6 +224,35 @@ def split_patterns(signal: list[float], pattern_count: int = 16) -> list[list[fl
     return chunks
 
 
+def infer_segment_drift(
+    channel: int,
+    mean_value: float | None,
+    std_value: float | None,
+    sample_count: int,
+) -> tuple[float, bool, str, str, int]:
+    """Return (inference_score, drift_flag, model_name, model_version, inference_ms)."""
+    if channel == 1:
+        model_name = SEGMENT_MODEL_NAME_LASER_A
+        model_version = SEGMENT_MODEL_VERSION_LASER_A
+        threshold = SEGMENT_DRIFT_THRESHOLD_LASER_A
+        inference_ms = SEGMENT_INFERENCE_MS_LASER_A
+    else:
+        model_name = SEGMENT_MODEL_NAME_LASER_B
+        model_version = SEGMENT_MODEL_VERSION_LASER_B
+        threshold = SEGMENT_DRIFT_THRESHOLD_LASER_B
+        inference_ms = SEGMENT_INFERENCE_MS_LASER_B
+
+    if sample_count <= 0 or mean_value is None:
+        return 0.0, False, model_name, model_version, inference_ms
+
+    std = abs(std_value or 0.0)
+    amplitude = abs(mean_value)
+    raw_score = amplitude / (amplitude + std + 1e-9)
+    inference_score = max(0.0, min(1.0, float(raw_score)))
+    drift_flag = inference_score >= threshold
+    return inference_score, drift_flag, model_name, model_version, inference_ms
+
+
 def build_segment_rows(
     source_path: Path,
     run_id: str,
@@ -230,6 +275,18 @@ def build_segment_rows(
             std_value = float(math.sqrt(variance))
             min_value = float(min(chunk))
             max_value = float(max(chunk))
+        (
+            inference_score,
+            segment_drift_flag,
+            model_name,
+            model_version,
+            inference_ms,
+        ) = infer_segment_drift(
+            channel=meta.channel,
+            mean_value=mean_value,
+            std_value=std_value,
+            sample_count=count,
+        )
 
         rows.append(
             {
@@ -250,6 +307,11 @@ def build_segment_rows(
                 "std_value": std_value,
                 "min_value": min_value,
                 "max_value": max_value,
+                "model_name": model_name,
+                "model_version": model_version,
+                "inference_score": inference_score,
+                "segment_drift_flag": segment_drift_flag,
+                "inference_ms": inference_ms,
             }
         )
 
@@ -292,6 +354,11 @@ def build_segments_df(spark: SparkSession, rows: list[dict]) -> DataFrame:
             T.StructField("std_value", T.DoubleType(), True),
             T.StructField("min_value", T.DoubleType(), True),
             T.StructField("max_value", T.DoubleType(), True),
+            T.StructField("model_name", T.StringType(), False),
+            T.StructField("model_version", T.StringType(), False),
+            T.StructField("inference_score", T.DoubleType(), False),
+            T.StructField("segment_drift_flag", T.BooleanType(), False),
+            T.StructField("inference_ms", T.IntegerType(), False),
         ]
     )
 
@@ -340,6 +407,7 @@ def build_summary_df(segments_df: DataFrame, cpd_threshold: float) -> DataFrame:
         F.sum(
             F.when(F.col("parity_group") == F.lit("even"), F.col("sample_count")).otherwise(F.lit(0))
         ).alias("even_sample_count"),
+        F.sum(F.when(F.col("segment_drift_flag"), F.lit(1)).otherwise(F.lit(0))).alias("drift_segment_count"),
     )
 
     with_mean = (
@@ -370,13 +438,15 @@ def build_summary_df(segments_df: DataFrame, cpd_threshold: float) -> DataFrame:
         )
         .withColumn("window_start", F.date_trunc("hour", F.col("processed_at")))
         .withColumn("window_end", F.expr("window_start + INTERVAL 1 HOUR"))
-        # 배터리 1공정 = pattern_summary 1행.
-        # 16개 세그먼트를 집계한 cpd_score(proxy)가 threshold 이상이면 "drift",
-        # 미만이면 "normal"로 기록한다.
-        # 실제 CPD 알고리즘 적용 시 이 withColumn만 교체하면 된다.
+        .withColumn(
+            "drift_segment_ratio",
+            F.when(F.col("record_count") > 0, F.col("drift_segment_count") / F.col("record_count")).otherwise(F.lit(0.0)),
+        )
+        # 배터리 1공정 + 채널 1개 = pattern_summary 1행.
+        # 채널별 16개 세그먼트 중 하나라도 drift면 채널 최종 판정은 drift.
         .withColumn(
             "quality_decision",
-            F.when(F.col("cpd_score") >= F.lit(cpd_threshold), F.lit("drift")).otherwise(F.lit("normal")),
+            F.when(F.col("drift_segment_count") > F.lit(0), F.lit("drift")).otherwise(F.lit("normal")),
         )
     )
 
@@ -394,6 +464,8 @@ def build_summary_df(segments_df: DataFrame, cpd_threshold: float) -> DataFrame:
         "even_pattern_mean",
         "odd_even_gap",
         "cpd_score",
+        "drift_segment_count",
+        "drift_segment_ratio",
         "quality_decision",
         "window_start",
         "window_end",
@@ -520,6 +592,11 @@ def ensure_postgres_tables(conn) -> None:
         std_value DOUBLE PRECISION,
         min_value DOUBLE PRECISION,
         max_value DOUBLE PRECISION,
+        model_name TEXT NOT NULL DEFAULT '',
+        model_version TEXT NOT NULL DEFAULT '',
+        inference_score DOUBLE PRECISION NOT NULL DEFAULT 0,
+        segment_drift_flag BOOLEAN NOT NULL DEFAULT FALSE,
+        inference_ms INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (run_id, source_file, channel, segment_index)
     );
 
@@ -538,20 +615,106 @@ def ensure_postgres_tables(conn) -> None:
         even_pattern_mean DOUBLE PRECISION,
         odd_even_gap DOUBLE PRECISION,
         cpd_score DOUBLE PRECISION,
+        drift_segment_count INTEGER NOT NULL DEFAULT 0,
+        drift_segment_ratio DOUBLE PRECISION NOT NULL DEFAULT 0,
         quality_decision TEXT NOT NULL,
         window_start TIMESTAMPTZ,
         window_end TIMESTAMPTZ,
         PRIMARY KEY (run_id, source_file, channel)
     );
 
+    ALTER TABLE welding.pattern_segment
+        ADD COLUMN IF NOT EXISTS model_name TEXT NOT NULL DEFAULT '';
+    ALTER TABLE welding.pattern_segment
+        ADD COLUMN IF NOT EXISTS model_version TEXT NOT NULL DEFAULT '';
+    ALTER TABLE welding.pattern_segment
+        ADD COLUMN IF NOT EXISTS inference_score DOUBLE PRECISION NOT NULL DEFAULT 0;
+    ALTER TABLE welding.pattern_segment
+        ADD COLUMN IF NOT EXISTS segment_drift_flag BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE welding.pattern_segment
+        ADD COLUMN IF NOT EXISTS inference_ms INTEGER NOT NULL DEFAULT 0;
+
+    ALTER TABLE welding.pattern_summary
+        ADD COLUMN IF NOT EXISTS drift_segment_count INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE welding.pattern_summary
+        ADD COLUMN IF NOT EXISTS drift_segment_ratio DOUBLE PRECISION NOT NULL DEFAULT 0;
+
     CREATE INDEX IF NOT EXISTS idx_pattern_segment_event
         ON welding.pattern_segment (event_date, line_number, product_id);
     CREATE INDEX IF NOT EXISTS idx_pattern_summary_event
         ON welding.pattern_summary (event_date, line_number, quality_decision);
+
+    CREATE TABLE IF NOT EXISTS welding.stage_event (
+        run_id UUID NOT NULL,
+        stage_name TEXT NOT NULL,
+        status TEXT NOT NULL,
+        started_at TIMESTAMPTZ,
+        ended_at TIMESTAMPTZ,
+        input_hash TEXT,
+        error_code TEXT,
+        error_message TEXT,
+        detail_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (run_id, stage_name)
+    );
     """
     with conn.cursor() as cur:
         cur.execute(ddl)
+        cur.execute(
+            """
+            ALTER TABLE welding.stage_event
+                ADD COLUMN IF NOT EXISTS input_hash TEXT,
+                ADD COLUMN IF NOT EXISTS error_code TEXT,
+                ADD COLUMN IF NOT EXISTS error_message TEXT
+            """
+        )
     conn.commit()
+
+
+def upsert_stage_event(
+    conn,
+    run_id: str,
+    stage_name: str,
+    status: str,
+    started_at: datetime | None,
+    ended_at: datetime | None,
+    detail: dict,
+    input_hash: str | None = None,
+    error_code: str | None = None,
+    error_message: str | None = None,
+) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO welding.stage_event (
+                run_id, stage_name, status, started_at, ended_at,
+                input_hash, error_code, error_message, detail_json
+            )
+            VALUES (%s::uuid, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+            ON CONFLICT (run_id, stage_name) DO UPDATE
+            SET
+                status = EXCLUDED.status,
+                started_at = EXCLUDED.started_at,
+                ended_at = EXCLUDED.ended_at,
+                input_hash = EXCLUDED.input_hash,
+                error_code = EXCLUDED.error_code,
+                error_message = EXCLUDED.error_message,
+                detail_json = EXCLUDED.detail_json,
+                updated_at = NOW()
+            """,
+            (
+                run_id,
+                stage_name,
+                status,
+                started_at,
+                ended_at,
+                input_hash,
+                error_code,
+                error_message,
+                json.dumps(detail),
+            ),
+        )
 
 
 def _iter_tuples(df: DataFrame, columns: list[str]):
@@ -584,12 +747,14 @@ def write_postgres(
     finished_at: datetime,
     output_dir: str,
     total_files: int,
+    skipped_files: int,
     line_count: int,
     host: str,
     port: int,
     dbname: str,
     user: str,
     password: str,
+    stage_events: dict | None = None,
 ) -> tuple[int, int]:
     if psycopg2 is None or execute_values is None:
         raise RuntimeError("psycopg2-binary is not installed. install dependencies first.")
@@ -621,12 +786,18 @@ def write_postgres(
             "std_value",
             "min_value",
             "max_value",
+            "model_name",
+            "model_version",
+            "inference_score",
+            "segment_drift_flag",
+            "inference_ms",
         ]
         segment_sql = """
         INSERT INTO welding.pattern_segment (
             run_id, source_file, channel, segment_index, processed_at, event_date,
             line_id, line_number, product_id, parity_group, parity_order, sample_count,
-            mean_value, std_value, min_value, max_value
+            mean_value, std_value, min_value, max_value,
+            model_name, model_version, inference_score, segment_drift_flag, inference_ms
         ) VALUES %s
         ON CONFLICT (run_id, source_file, channel, segment_index) DO UPDATE
         SET
@@ -641,7 +812,12 @@ def write_postgres(
             mean_value = EXCLUDED.mean_value,
             std_value = EXCLUDED.std_value,
             min_value = EXCLUDED.min_value,
-            max_value = EXCLUDED.max_value
+            max_value = EXCLUDED.max_value,
+            model_name = EXCLUDED.model_name,
+            model_version = EXCLUDED.model_version,
+            inference_score = EXCLUDED.inference_score,
+            segment_drift_flag = EXCLUDED.segment_drift_flag,
+            inference_ms = EXCLUDED.inference_ms
         """
         segment_count = _execute_values_in_batches(
             conn, segment_sql, _iter_tuples(segments_df, segment_cols), batch_size=2000
@@ -662,6 +838,8 @@ def write_postgres(
             "even_pattern_mean",
             "odd_even_gap",
             "cpd_score",
+            "drift_segment_count",
+            "drift_segment_ratio",
             "quality_decision",
             "window_start",
             "window_end",
@@ -670,7 +848,8 @@ def write_postgres(
         INSERT INTO welding.pattern_summary (
             run_id, source_file, channel, processed_at, event_date, line_id, line_number,
             product_id, record_count, total_samples, odd_pattern_mean, even_pattern_mean,
-            odd_even_gap, cpd_score, quality_decision, window_start, window_end
+            odd_even_gap, cpd_score, drift_segment_count, drift_segment_ratio,
+            quality_decision, window_start, window_end
         ) VALUES %s
         ON CONFLICT (run_id, source_file, channel) DO UPDATE
         SET
@@ -685,6 +864,8 @@ def write_postgres(
             even_pattern_mean = EXCLUDED.even_pattern_mean,
             odd_even_gap = EXCLUDED.odd_even_gap,
             cpd_score = EXCLUDED.cpd_score,
+            drift_segment_count = EXCLUDED.drift_segment_count,
+            drift_segment_ratio = EXCLUDED.drift_segment_ratio,
             quality_decision = EXCLUDED.quality_decision,
             window_start = EXCLUDED.window_start,
             window_end = EXCLUDED.window_end
@@ -693,12 +874,80 @@ def write_postgres(
             conn, summary_sql, _iter_tuples(summary_df, summary_cols), batch_size=1000
         )
 
-        import json as _json
-        details_json = _json.dumps({
+        details_json = json.dumps({
             # 1 producer = 1 production line → producer_count == line_count
             "line_count": line_count,
             "producer_count": line_count,
         })
+
+        stage_events = stage_events or {}
+
+        chunk_stage = stage_events.get("chunk_complete", {})
+        chunk_detail = {
+            "total_files": int(total_files),
+            "skipped_files": int(skipped_files),
+            "line_count": int(line_count),
+        }
+        chunk_detail.update(chunk_stage.get("detail", {}))
+        upsert_stage_event(
+            conn=conn,
+            run_id=run_id,
+            stage_name="chunk_complete",
+            status="SUCCESS",
+            started_at=chunk_stage.get("started_at", started_at),
+            ended_at=chunk_stage.get("ended_at", finished_at),
+            detail=chunk_detail,
+        )
+
+        seg_stage = stage_events.get("segmentation_complete", {})
+        seg_detail = {
+            "segment_rows": int(segment_count),
+            "segments_per_channel_expected": 16,
+        }
+        seg_detail.update(seg_stage.get("detail", {}))
+        upsert_stage_event(
+            conn=conn,
+            run_id=run_id,
+            stage_name="segmentation_complete",
+            status="SUCCESS",
+            started_at=seg_stage.get("started_at", started_at),
+            ended_at=seg_stage.get("ended_at", finished_at),
+            detail=seg_detail,
+        )
+
+        inf_stage = stage_events.get("inference_complete", {})
+        inf_detail = {
+            "segment_rows": int(segment_count),
+            "channels_per_product_expected": 2,
+            "segments_per_product_expected": 32,
+        }
+        inf_detail.update(inf_stage.get("detail", {}))
+        upsert_stage_event(
+            conn=conn,
+            run_id=run_id,
+            stage_name="inference_complete",
+            status="SUCCESS",
+            started_at=inf_stage.get("started_at", started_at),
+            ended_at=inf_stage.get("ended_at", finished_at),
+            detail=inf_detail,
+        )
+
+        load_stage = stage_events.get("load_complete", {})
+        load_detail = {
+            "summary_rows": int(summary_count),
+            "segment_rows": int(segment_count),
+        }
+        load_detail.update(load_stage.get("detail", {}))
+        upsert_stage_event(
+            conn=conn,
+            run_id=run_id,
+            stage_name="load_complete",
+            status="SUCCESS",
+            started_at=load_stage.get("started_at", started_at),
+            ended_at=load_stage.get("ended_at", finished_at),
+            detail=load_detail,
+        )
+
         with conn.cursor() as cur:
             cur.execute(
                 """
@@ -736,6 +985,87 @@ def write_postgres(
         conn.close()
 
 
+def write_failure_markers(
+    *,
+    run_id: str,
+    started_at: datetime,
+    failed_at: datetime,
+    current_stage: str,
+    output_dir: str,
+    total_files: int,
+    skipped_files: int,
+    error_message: str,
+    host: str,
+    port: int,
+    dbname: str,
+    user: str,
+    password: str,
+) -> None:
+    """Persist failure state so Airflow can inspect exact stage failure."""
+    if psycopg2 is None:
+        return
+
+    conn = psycopg2.connect(
+        host=host,
+        port=port,
+        dbname=dbname,
+        user=user,
+        password=password,
+    )
+    try:
+        ensure_postgres_tables(conn)
+        upsert_stage_event(
+            conn=conn,
+            run_id=run_id,
+            stage_name=current_stage,
+            status="FAILED",
+            started_at=started_at,
+            ended_at=failed_at,
+            error_code="SPARK_STAGE_FAILED",
+            error_message=error_message[:2000],
+            detail={
+                "total_files": int(total_files),
+                "skipped_files": int(skipped_files),
+                "failed_stage": current_stage,
+            },
+        )
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO welding.spark_batch_run (
+                    run_id, status, started_at, finished_at, total_files,
+                    total_segment_rows, total_summary_rows, output_dir, details
+                )
+                VALUES (%s, %s, %s, %s, %s, 0, 0, %s, %s::jsonb)
+                ON CONFLICT (run_id) DO UPDATE
+                SET
+                    status = EXCLUDED.status,
+                    finished_at = EXCLUDED.finished_at,
+                    total_files = EXCLUDED.total_files,
+                    output_dir = EXCLUDED.output_dir,
+                    details = EXCLUDED.details
+                """,
+                (
+                    run_id,
+                    "FAILED",
+                    started_at,
+                    failed_at,
+                    int(total_files),
+                    output_dir,
+                    json.dumps(
+                        {
+                            "failed_stage": current_stage,
+                            "error_message": error_message[:2000],
+                            "skipped_files": int(skipped_files),
+                        }
+                    ),
+                ),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Spark batch preprocessing for welding CSV files",
@@ -765,9 +1095,33 @@ def run(args: argparse.Namespace) -> int:
     logger.info("Starting spark batch preprocessing...")
 
     started_at = datetime.now(timezone.utc)
+    current_stage = "chunk_complete"
+    stage_events: dict[str, dict] = {
+        "chunk_complete": {"started_at": started_at, "detail": {}},
+        "segmentation_complete": {"started_at": started_at, "detail": {}},
+        "inference_complete": {"started_at": started_at, "detail": {}},
+        "load_complete": {"started_at": started_at, "detail": {}},
+    }
     files = discover_csv_files(args.input_dir, args.max_files)
     if not files:
         logger.warning("No CSV files found in %s", args.input_dir)
+        if args.write_postgres:
+            failed_at = datetime.now(timezone.utc)
+            write_failure_markers(
+                run_id=args.run_id,
+                started_at=started_at,
+                failed_at=failed_at,
+                current_stage=current_stage,
+                output_dir=args.output_dir,
+                total_files=0,
+                skipped_files=0,
+                error_message=f"No CSV files found in {args.input_dir}",
+                host=args.postgres_host,
+                port=args.postgres_port,
+                dbname=args.postgres_db,
+                user=args.postgres_user,
+                password=args.postgres_password,
+            )
         return 2
 
     # --oldest-date-only: parse metadata quickly and filter to oldest date
@@ -800,9 +1154,38 @@ def run(args: argparse.Namespace) -> int:
             skipped += 1
             logger.warning("skip %s: %s", path, exc)
 
+    chunk_done_at = datetime.now(timezone.utc)
+    stage_events["chunk_complete"] = {
+        "started_at": started_at,
+        "ended_at": chunk_done_at,
+        "detail": {
+            "total_files": int(len(files)),
+            "skipped_files": int(skipped),
+        },
+    }
+
     if not rows:
         logger.error("No valid signals were parsed from input CSV files.")
+        if args.write_postgres:
+            write_failure_markers(
+                run_id=args.run_id,
+                started_at=started_at,
+                failed_at=datetime.now(timezone.utc),
+                current_stage=current_stage,
+                output_dir=args.output_dir,
+                total_files=len(files),
+                skipped_files=skipped,
+                error_message="No valid numeric signals parsed from input files",
+                host=args.postgres_host,
+                port=args.postgres_port,
+                dbname=args.postgres_db,
+                user=args.postgres_user,
+                password=args.postgres_password,
+            )
         return 3
+
+    current_stage = "segmentation_complete"
+    stage_events["segmentation_complete"]["started_at"] = chunk_done_at
 
     spark = create_spark(master=args.master, shuffle_partitions=args.shuffle_partitions)
     try:
@@ -810,21 +1193,67 @@ def run(args: argparse.Namespace) -> int:
         summary_df = build_summary_df(segments_df, args.cpd_threshold).cache()
 
         segment_rows = segments_df.count()
+        seg_done_at = datetime.now(timezone.utc)
+        stage_events["segmentation_complete"] = {
+            "started_at": chunk_done_at,
+            "ended_at": seg_done_at,
+            "detail": {
+                "segment_rows": int(segment_rows),
+                "segments_per_channel_expected": 16,
+            },
+        }
+
+        current_stage = "inference_complete"
+        stage_events["inference_complete"]["started_at"] = seg_done_at
         summary_rows = summary_df.count()
-        segments_path, summary_path = write_parquet(segments_df, summary_df, args.output_dir)
-        (
-            drift_summary_rows,
-            drift_segment_rows,
-            drift_raw_files,
-            drift_summary_path,
-            drift_segments_path,
-            drift_raw_path,
-        ) = write_drift_artifacts(
-            segments_df=segments_df,
-            summary_df=summary_df,
-            output_dir=args.output_dir,
-            input_dir=args.input_dir,
-        )
+        inf_done_at = datetime.now(timezone.utc)
+        stage_events["inference_complete"] = {
+            "started_at": seg_done_at,
+            "ended_at": inf_done_at,
+            "detail": {
+                "segment_rows": int(segment_rows),
+                "summary_rows": int(summary_rows),
+                "channels_per_product_expected": 2,
+                "segments_per_product_expected": 32,
+            },
+        }
+
+        current_stage = "load_complete"
+        stage_events["load_complete"]["started_at"] = inf_done_at
+        segments_path = ""
+        summary_path = ""
+        drift_summary_rows = 0
+        drift_segment_rows = 0
+        drift_raw_files = 0
+        drift_summary_path = ""
+        drift_segments_path = ""
+        drift_raw_path = ""
+        parquet_write_error = ""
+
+        try:
+            segments_path, summary_path = write_parquet(segments_df, summary_df, args.output_dir)
+            (
+                drift_summary_rows,
+                drift_segment_rows,
+                drift_raw_files,
+                drift_summary_path,
+                drift_segments_path,
+                drift_raw_path,
+            ) = write_drift_artifacts(
+                segments_df=segments_df,
+                summary_df=summary_df,
+                output_dir=args.output_dir,
+                input_dir=args.input_dir,
+            )
+        except Exception as parquet_exc:
+            parquet_write_error = str(parquet_exc)
+            if SPARK_PARQUET_STRICT:
+                raise
+            logger.warning(
+                "Parquet artifact write skipped due to filesystem permission/runtime issue. "
+                "DB writes will continue. error=%s",
+                parquet_write_error,
+            )
 
         logger.info("run_id=%s", args.run_id)
         logger.info("input_files=%s skipped_files=%s", len(files), skipped)
@@ -848,6 +1277,13 @@ def run(args: argparse.Namespace) -> int:
             # 이 배치에서 처리된 고유 생산라인 수 = 프로듀서 컨테이너 수
             line_count = summary_df.select("line_id").distinct().count()
             logger.info("line_count=%s (= producer_count)", line_count)
+            stage_events["load_complete"]["detail"] = {
+                "line_count": int(line_count),
+                "drift_summary_rows": int(drift_summary_rows),
+                "drift_segment_rows": int(drift_segment_rows),
+                "drift_raw_files": int(drift_raw_files),
+                "parquet_write_error": parquet_write_error,
+            }
             seg_written, sum_written = write_postgres(
                 summary_df=summary_df,
                 segments_df=segments_df,
@@ -856,16 +1292,19 @@ def run(args: argparse.Namespace) -> int:
                 finished_at=finished_at,
                 output_dir=args.output_dir,
                 total_files=len(files),
+                skipped_files=skipped,
                 line_count=line_count,
                 host=args.postgres_host,
                 port=args.postgres_port,
                 dbname=args.postgres_db,
                 user=args.postgres_user,
                 password=args.postgres_password,
+                stage_events=stage_events,
             )
             logger.info("postgres_written_segments=%s", seg_written)
             logger.info("postgres_written_summary=%s", sum_written)
             finished_at = datetime.now(timezone.utc)
+            stage_events["load_complete"]["ended_at"] = finished_at
 
         duration_sec = (finished_at - started_at).total_seconds()
         files_per_sec = len(files) / duration_sec if duration_sec > 0 else 0.0
@@ -878,6 +1317,25 @@ def run(args: argparse.Namespace) -> int:
         )
     except Exception as e:
         logger.error("Error during batch processing: %s", e)
+        if args.write_postgres:
+            try:
+                write_failure_markers(
+                    run_id=args.run_id,
+                    started_at=started_at,
+                    failed_at=datetime.now(timezone.utc),
+                    current_stage=current_stage,
+                    output_dir=args.output_dir,
+                    total_files=len(files),
+                    skipped_files=skipped,
+                    error_message=str(e),
+                    host=args.postgres_host,
+                    port=args.postgres_port,
+                    dbname=args.postgres_db,
+                    user=args.postgres_user,
+                    password=args.postgres_password,
+                )
+            except Exception as marker_exc:
+                logger.warning("Failed to persist failure markers: %s", marker_exc)
         raise
     finally:
         spark.stop()

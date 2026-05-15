@@ -16,21 +16,20 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_FILE="${ENV_FILE:-${ROOT_DIR}/.env}"
+ENV_UTILS="${ROOT_DIR}/scripts/lib/env_utils.sh"
 DOWN_AFTER_RUN="${DOWN_AFTER_RUN:-0}"
+EXPERIMENT_MODE="${EXPERIMENT_MODE:-0}"
+
+if [[ -f "${ENV_UTILS}" ]]; then
+  # shellcheck disable=SC1090
+  source "${ENV_UTILS}"
+fi
 
 load_env_file() {
-  local env_file="$1"
-  if [[ ! -f "${env_file}" ]]; then
-    return 0
+  if declare -F load_env_file_without_override >/dev/null 2>&1; then
+    load_env_file_without_override "$1"
+    return
   fi
-  set -a
-  # shellcheck disable=SC1090
-  source <(
-    sed 's/\r$//' "${env_file}" \
-      | grep -v '^[[:space:]]*#' \
-      | grep -v '^[[:space:]]*$'
-  )
-  set +a
 }
 
 load_env_file "${ENV_FILE}"
@@ -38,9 +37,10 @@ load_env_file "${ENV_FILE}"
 usage() {
   cat <<'EOF'
 Usage:
-  bash scripts/run_20220417_replay_and_dag_metrics.sh [--down-after-run] [--help]
+  bash scripts/run_20220417_replay_and_dag_metrics.sh [--experimental] [--down-after-run] [--help]
 
 Options:
+  --experimental   Allow replay/re-ingest of already processed DATE_FOLDER for experiment runs.
   --down-after-run   Stop Airflow and all docker compose containers after run.
   --help             Show this help message.
 EOF
@@ -49,6 +49,10 @@ EOF
 parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
+      --experimental)
+        EXPERIMENT_MODE=1
+        shift
+        ;;
       --down-after-run)
         DOWN_AFTER_RUN=1
         shift
@@ -144,15 +148,26 @@ csv_to_sql_in_list() {
 require_cmd docker
 parse_args "$@"
 
-if [[ -z "${POSTGRES_PASSWORD}" ]]; then
-  POSTGRES_PASSWORD="$(
-    docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "${POSTGRES_CONTAINER}" 2>/dev/null \
-      | awk -F= '$1=="POSTGRES_PASSWORD"{print $2; exit}'
-  )"
+if declare -F ensure_postgres_password >/dev/null 2>&1; then
+  ensure_postgres_password "${ENV_FILE}" "${POSTGRES_CONTAINER}" "welding_local_auto_pw"
 fi
+POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-}"
 if [[ -z "${POSTGRES_PASSWORD}" ]]; then
-  echo "ERROR: POSTGRES_PASSWORD must be set (env/.env/container env)." >&2
+  echo "ERROR: POSTGRES_PASSWORD could not be resolved." >&2
   exit 1
+fi
+
+if [[ "${EXPERIMENT_MODE}" == "1" ]]; then
+  target_date_iso="${DATE_FOLDER:0:4}-${DATE_FOLDER:4:2}-${DATE_FOLDER:6:2}"
+  log "EXPERIMENT_MODE=1 -> clear replay-completed heartbeat for ${target_date_iso}"
+  docker exec -i "${POSTGRES_CONTAINER}" psql \
+    -U "${POSTGRES_USER}" \
+    -d "${POSTGRES_DB}" \
+    -v ON_ERROR_STOP=1 \
+    -c "DELETE FROM welding.pipeline_heartbeat
+        WHERE component_name='airflow.welding_batch_ingest'
+          AND details->>'status'='REPLAY_COMPLETED'
+          AND details->>'target_date'='${target_date_iso}';" >/dev/null
 fi
 
 if [[ ! -d "${HOST_DATA_DIR}/${DATE_FOLDER}" ]]; then

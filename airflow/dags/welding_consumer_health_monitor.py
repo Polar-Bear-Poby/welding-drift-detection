@@ -64,6 +64,7 @@ CONSUMER_GROUPS  = {
     "welding-stream-laser-a": EXPECTED_LASER_A,
     "welding-stream-laser-b": EXPECTED_LASER_B,
 }
+CONSUMER_LAG_ALERT_THRESHOLD = int(os.getenv("CONSUMER_LAG_ALERT_THRESHOLD", "5000"))
 
 # [fix #2] 재기동: Airflow 컨테이너에서 spark 컨테이너 내부 프로세스를 직접 재기동
 RESTART_CMD = (
@@ -137,6 +138,43 @@ def _get_group_member_count(group_id: str) -> int:
     return len(active_ids)
 
 
+def _get_group_lag_summary(group_id: str) -> dict:
+    """Return lightweight lag summary from kafka-consumer-groups --describe."""
+    result = subprocess.run(
+        f"docker exec {KAFKA_CONTAINER} "
+        f"kafka-consumer-groups --bootstrap-server {KAFKA_BOOTSTRAP} "
+        f"--group {group_id} --describe",
+        shell=True, capture_output=True, text=True, timeout=30,
+    )
+    lines = [l for l in result.stdout.strip().split("\n") if l.strip() and not l.startswith("GROUP")]
+    total_lag = 0
+    max_lag = 0
+    parse_errors = 0
+    for line in lines:
+        parts = line.split()
+        if len(parts) < 6:
+            parse_errors += 1
+            continue
+        lag_token = parts[5]
+        if lag_token == "-":
+            continue
+        if not lag_token.lstrip("-").isdigit():
+            parse_errors += 1
+            continue
+        lag_val = int(lag_token)
+        if lag_val < 0:
+            parse_errors += 1
+            continue
+        total_lag += lag_val
+        max_lag = max(max_lag, lag_val)
+    return {
+        "total_lag": total_lag,
+        "max_lag": max_lag,
+        "parse_errors": parse_errors,
+        "lag_healthy": parse_errors == 0 and max_lag <= CONSUMER_LAG_ALERT_THRESHOLD,
+    }
+
+
 @dag(
     dag_id="welding_consumer_health_monitor",
     schedule="*/5 * * * *",
@@ -169,7 +207,7 @@ def welding_consumer_health_monitor_dag():
     def check_consumer_count():
         """
         Kafka consumer-group별로 활성 컨슈머 수를 확인한다.
-        laser_a 또는 laser_b 그룹 중 하나라도 기대치 미달이면 재기동 브랜치.
+        laser_a 또는 laser_b 그룹 중 하나라도 기대치 미달이거나 LAG 임계치 초과면 재기동 브랜치.
         """
         group_status = {}
         all_healthy = True
@@ -181,16 +219,28 @@ def welding_consumer_health_monitor_dag():
                 log.error("그룹 %s 확인 실패: %s", group_id, exc)
                 count = -1
 
-            healthy = count >= expected
-            group_status[group_id] = {"count": count, "expected": expected, "healthy": healthy}
+            lag = _get_group_lag_summary(group_id)
+            healthy = count >= expected and lag["lag_healthy"]
+            group_status[group_id] = {
+                "count": count,
+                "expected": expected,
+                "healthy": healthy,
+                "total_lag": lag["total_lag"],
+                "max_lag": lag["max_lag"],
+                "lag_threshold": CONSUMER_LAG_ALERT_THRESHOLD,
+                "lag_parse_errors": lag["parse_errors"],
+            }
             if not healthy:
                 all_healthy = False
                 log.warning(
-                    "컨슈머 부족 — 그룹: %s, 현재: %d, 기대: %d",
-                    group_id, count, expected,
+                    "컨슈머 상태 이상 — 그룹: %s, 현재: %d, 기대: %d, total_lag: %d, max_lag: %d",
+                    group_id, count, expected, lag["total_lag"], lag["max_lag"],
                 )
             else:
-                log.info("컨슈머 정상 — 그룹: %s, 현재: %d", group_id, count)
+                log.info(
+                    "컨슈머 정상 — 그룹: %s, 현재: %d, total_lag: %d, max_lag: %d",
+                    group_id, count, lag["total_lag"], lag["max_lag"],
+                )
 
         with psycopg2.connect(DB_CONN_STR) as conn:
             with conn.cursor() as cur:

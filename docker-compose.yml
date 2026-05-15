@@ -9,8 +9,10 @@ x-airflow-common: &airflow-common
   build:
     context: .
     dockerfile: Dockerfile.airflow
-  image: welding-airflow:3.0.1
-  user: "${AIRFLOW_UID:-50000}:0"
+  image: welding-airflow:3.1.8
+  # Local lab mode: Airflow tasks need docker.sock access for docker exec/run.
+  # Use root by default to avoid socket permission failures.
+  user: "${AIRFLOW_UID:-0}:0"
   environment:
     &airflow-common-env
     <<: *db-common-env
@@ -18,22 +20,36 @@ x-airflow-common: &airflow-common
     # PIP requirements are now in Dockerfile.airflow
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-welding}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-welding_drift}
     AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:-}
+    AIRFLOW__API__SECRET_KEY: ${AIRFLOW_API_SECRET_KEY:-welding-airflow-api-secret-key}
+    AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_WEBSERVER_SECRET_KEY:-welding-airflow-webserver-secret-key}
     AIRFLOW__CORE__LOAD_EXAMPLES: "false"
     AIRFLOW__FAB__AUTH_ROLE_PUBLIC: "Admin"
     AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "True"
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
     AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: "http://airflow-webserver:8080/execution/"
+    AIRFLOW__EXECUTION_API__JWT_EXPIRATION_TIME: ${AIRFLOW_EXECUTION_API_JWT_EXPIRATION_TIME:-7200}
+    AIRFLOW__CORE__INTERNAL_API_SECRET_KEY: ${AIRFLOW_INTERNAL_API_SECRET_KEY:-welding-airflow-internal-api-secret-key}
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_API_AUTH_JWT_SECRET:-welding-airflow-api-auth-jwt-secret}
+    CONSUMER_COUNT: ${CONSUMER_COUNT:-2}
+    EXPECTED_LASER_A: ${EXPECTED_LASER_A:-1}
+    EXPECTED_LASER_B: ${EXPECTED_LASER_B:-1}
+    REPLAY_LINE_COUNT: ${REPLAY_LINE_COUNT:-2}
     AIRFLOW_CONN_KAFKA_DEFAULT: kafka://kafka:9092
     AIRFLOW_CONN_SPARK_DEFAULT: spark://spark-master:7077
     AIRFLOW_CONN_WELDING_POSTGRES: postgresql://${POSTGRES_USER:-welding}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-welding_drift}
+    SPARK_BATCH_OUTPUT_DIR: ${SPARK_BATCH_OUTPUT_DIR:-/spark-out/spark_batch}
+    BACKFILL_STORAGE_DIR: ${BACKFILL_STORAGE_DIR:-/spark-out/spark_batch}
+    SPARK_INTERMEDIATE_ROOTS: ${SPARK_INTERMEDIATE_ROOTS:-/spark-out/intermediate,/spark-out/spark_batch/intermediate}
     # Airflow 3 Auth Manager explicit setting
     AIRFLOW__CORE__AUTH_MANAGER: "airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager"
     DOCKER_HOST: unix:///var/run/docker.sock
   volumes:
     - ./airflow/dags:/opt/airflow/dags
-    - ./airflow/logs:/opt/airflow/logs
+    - airflow-logs:/opt/airflow/logs
     - ./airflow/plugins:/opt/airflow/plugins
     - ./scripts:/opt/airflow/scripts:ro
+    - spark-batch-output:/spark-out
     - /var/run/docker.sock:/var/run/docker.sock
   networks:
     - welding-net
@@ -106,11 +122,11 @@ services:
       airflow-init:
         condition: service_completed_successfully
     healthcheck:
-      test: ["CMD", "airflow", "jobs", "check", "--job-type", "DagProcessorJob"]
+      test: ["CMD-SHELL", "python -m airflow jobs check --job-type DagProcessorJob"]
       interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 30s
+      timeout: 30s
+      retries: 8
+      start_period: 120s
 
   airflow-triggerer:
     <<: *airflow-common
@@ -119,11 +135,11 @@ services:
       airflow-init:
         condition: service_completed_successfully
     healthcheck:
-      test: ["CMD-SHELL", 'airflow jobs check --job-type TriggererJob --hostname "$${HOSTNAME}"']
+      test: ["CMD-SHELL", 'python -m airflow jobs check --job-type TriggererJob --hostname "$${HOSTNAME}"']
       interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 30s
+      timeout: 30s
+      retries: 8
+      start_period: 120s
 
   kafka-init:
     image: confluentinc/cp-kafka:7.5.3
@@ -135,15 +151,18 @@ services:
     command:
       - |
         echo 'Creating Kafka topics'
-        kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic welding.raw.v1 --partitions 8 --replication-factor 1 --config retention.ms=604800000 --config compression.type=producer --config max.message.bytes=5242880
-        kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic welding.raw.laser_a.v1 --partitions 8 --replication-factor 1 --config retention.ms=604800000 --config compression.type=producer --config max.message.bytes=5242880
-        kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic welding.raw.laser_b.v1 --partitions 8 --replication-factor 1 --config retention.ms=604800000 --config compression.type=producer --config max.message.bytes=5242880
-        kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic welding.validated.v1 --partitions 8 --replication-factor 1 --config retention.ms=604800000 --config compression.type=producer
+        # retention.ms: DB 적재 완료 전 오류가 나도 Kafka에서 재처리할 수 있도록 보존한다.
+        # 기본값 604800000 = 7일. KAFKA_TOPIC_RETENTION_MS 환경변수로 조정 가능.
+        RETENTION="${KAFKA_TOPIC_RETENTION_MS:-604800000}"
+        kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic welding.raw.v1 --partitions 8 --replication-factor 1 --config retention.ms=$${RETENTION} --config compression.type=producer --config max.message.bytes=5242880
+        kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic welding.raw.laser_a.v1 --partitions 8 --replication-factor 1 --config retention.ms=$${RETENTION} --config compression.type=producer --config max.message.bytes=5242880
+        kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic welding.raw.laser_b.v1 --partitions 8 --replication-factor 1 --config retention.ms=$${RETENTION} --config compression.type=producer --config max.message.bytes=5242880
+        kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic welding.validated.v1 --partitions 8 --replication-factor 1 --config retention.ms=$${RETENTION} --config compression.type=producer
         kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic welding.features.v1 --partitions 8 --replication-factor 1 --config retention.ms=2592000000 --config cleanup.policy=compact,delete --config compression.type=producer
         kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic welding.quality_decision.v1 --partitions 4 --replication-factor 1 --config retention.ms=2592000000
-        kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic welding.dlq.v1 --partitions 4 --replication-factor 1 --config retention.ms=604800000
+        kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic welding.dlq.v1 --partitions 4 --replication-factor 1 --config retention.ms=$${RETENTION}
         kafka-topics --bootstrap-server kafka:9092 --list
-        echo 'Kafka topic initialization done'
+        echo "Kafka topic initialization done (retention.ms=$${RETENTION})"
     networks:
       - welding-net
 
@@ -190,6 +209,7 @@ services:
       dockerfile: Dockerfile.spark
     image: welding-spark:3.5.1
     container_name: welding-spark-master
+    user: "0:0"
     restart: unless-stopped
     depends_on:
       kafka-init:
@@ -214,8 +234,12 @@ services:
       - spark-events:/opt/spark/events
       - ${DATA_DIR:?set DATA_DIR in .env}:/data:ro
       - ${STORAGE_DIR:?set STORAGE_DIR in .env}:/storage
+      - spark-batch-output:/spark-out
       - ./spark_batch.py:/opt/spark/apps/spark_batch.py:ro
       - ./spark_streaming.py:/opt/spark/apps/spark_streaming.py:ro
+      # Spark consumer 로그를 호스트와 공유: FastAPI가 docker exec 없이 읽을 수 있음
+      # 실험 종료 후 storage/logs/ 에서 로그 파일을 직접 확인 가능
+      - ./storage/logs:/storage/logs
     environment:
       <<: *db-common-env
     networks:
@@ -227,6 +251,7 @@ services:
       dockerfile: Dockerfile.spark
     image: welding-spark:3.5.1
     container_name: welding-spark-worker
+    user: "0:0"
     restart: unless-stopped
     depends_on:
       spark-master:
@@ -243,12 +268,13 @@ services:
         "--cores",
         "2",
         "--memory",
-        "2g"
+        "6g"
       ]
     volumes:
       - spark-events:/opt/spark/events
       - ${DATA_DIR:?set DATA_DIR in .env}:/data:ro
       - ${STORAGE_DIR:?set STORAGE_DIR in .env}:/storage
+      - spark-batch-output:/spark-out
       - ./spark_batch.py:/opt/spark/apps/spark_batch.py:ro
       - ./spark_streaming.py:/opt/spark/apps/spark_streaming.py:ro
     environment:
@@ -352,6 +378,8 @@ services:
         condition: service_healthy
     ports:
       - "${API_PORT:-8001}:8000"
+    volumes:
+      - ./storage/logs:/storage/logs
     networks:
       - welding-net
 
@@ -478,11 +506,13 @@ services:
       - welding-net
 
 volumes:
+  airflow-logs:
   zk-data:
   zk-log:
   kafka-data:
   postgres-data:
   spark-events:
+  spark-batch-output:
   prometheus-data:
   grafana-data:
 

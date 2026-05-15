@@ -142,3 +142,30 @@ def fetch_run_summary(
     row["producer_count"] = details.get("producer_count")
     return row
 
+
+def fetch_pattern_segments(
+    conn: psycopg2.extensions.connection, product_id: str
+) -> list[dict[str, Any]]:
+    """특정 배터리의 16균등 분할 세그먼트 상세 데이터를 조회합니다."""
+    sql = """
+    SELECT
+        product_id,
+        channel,
+        segment_index,
+        sample_count,
+        mean_value,
+        std_value,
+        inference_score,
+        segment_drift_flag,
+        processed_at
+    FROM welding.pattern_segment
+    WHERE product_id = %s
+    ORDER BY channel, segment_index
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql, (product_id,))
+        rows = cur.fetchall()
+    for row in rows:
+        row["channel"] = _channel_name(row["channel"])
+    return rows
+

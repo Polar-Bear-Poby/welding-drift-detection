@@ -35,14 +35,16 @@ DB_CONN_STR = f"host={_PG_HOST} port={_PG_PORT} dbname={_PG_DB} user={_PG_USER} 
 DRIFT_THRESHOLD = 0.05
 # [fix #3/B] 데이터 최소 행 수 — 라인 3개 × 채널 2개
 MIN_EXPECTED_ROWS = 6
+DAILY_REPORT_CATCHUP = os.getenv("DAILY_REPORT_CATCHUP", "false").strip().lower() in {"1", "true", "yes", "on"}
+DAILY_REPORT_MAX_ACTIVE_RUNS = int(os.getenv("DAILY_REPORT_MAX_ACTIVE_RUNS", "1"))
 
 
 @dag(
     dag_id="welding_daily_quality_report",
     schedule="0 1 * * *",
     start_date=datetime(2026, 4, 1),
-    catchup=True,
-    max_active_runs=3,
+    catchup=DAILY_REPORT_CATCHUP,
+    max_active_runs=DAILY_REPORT_MAX_ACTIVE_RUNS,
     tags=["welding", "airflow3", "report"],
     default_args={"owner": "welding-team", "retries": 3},
     doc_md="""

@@ -29,6 +29,7 @@ DB_CONN_STR = (
 )
 ALERT_WEBHOOK_URL = os.getenv("ALERT_WEBHOOK_URL", "").strip()
 HEALTH_WINDOW_MIN = 15
+REASSEMBLY_HARD_FAIL_THRESHOLD = int(os.getenv("REASSEMBLY_HARD_FAIL_THRESHOLD", "0"))
 TOPIC_RAW_LASER_A = os.getenv("TOPIC_RAW_LASER_A", "welding.raw.laser_a.v1")
 TOPIC_RAW_LASER_B = os.getenv("TOPIC_RAW_LASER_B", "welding.raw.laser_b.v1")
 SOURCE_LASER_A = f"kafka://{TOPIC_RAW_LASER_A}"
@@ -94,6 +95,80 @@ def _recent_channel_counts(window_minutes: int) -> tuple[int, int]:
     return counts[1], counts[0]  # (laser_a_count, laser_b_count)
 
 
+def _recent_reassembly_issues(window_minutes: int) -> tuple[int, int]:
+    """Return latest-key incomplete/hard-fail counts from reassembly_audit."""
+    try:
+        with psycopg2.connect(DB_CONN_STR) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS welding.reassembly_audit (
+                        observed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        batch_id BIGINT NOT NULL,
+                        window_start TIMESTAMPTZ,
+                        window_end TIMESTAMPTZ,
+                        product_instance_id TEXT NOT NULL,
+                        product_id TEXT,
+                        line_id TEXT NOT NULL,
+                        lead_num INTEGER NOT NULL,
+                        channel SMALLINT NOT NULL,
+                        replay_iteration INTEGER NOT NULL DEFAULT 0,
+                        expected_chunks INTEGER NOT NULL DEFAULT 0,
+                        received_chunks INTEGER NOT NULL DEFAULT 0,
+                        unique_chunk_indexes INTEGER NOT NULL DEFAULT 0,
+                        total_chunks_variants INTEGER NOT NULL DEFAULT 0,
+                        min_chunk_index INTEGER,
+                        max_chunk_index INTEGER,
+                        expected_samples INTEGER,
+                        reassembled_samples INTEGER,
+                        reassembly_status TEXT NOT NULL,
+                        status_reason TEXT,
+                        PRIMARY KEY (
+                            batch_id,
+                            product_instance_id,
+                            line_id,
+                            lead_num,
+                            channel,
+                            replay_iteration
+                        )
+                    )
+                    """
+                )
+                cur.execute(
+                    """
+                    WITH latest AS (
+                        SELECT DISTINCT ON (
+                            product_instance_id, line_id, lead_num, channel, replay_iteration
+                        )
+                            reassembly_status
+                        FROM welding.reassembly_audit
+                        WHERE observed_at >= NOW() - (%s || ' minutes')::interval
+                        ORDER BY
+                            product_instance_id,
+                            line_id,
+                            lead_num,
+                            channel,
+                            replay_iteration,
+                            observed_at DESC
+                    )
+                    SELECT
+                        COUNT(*) FILTER (WHERE reassembly_status = 'incomplete_chunks') AS incomplete_count,
+                        COUNT(*) FILTER (
+                            WHERE reassembly_status IN ('mixed_chunk_metadata', 'sample_count_mismatch')
+                        ) AS hard_fail_count
+                    FROM latest
+                    """,
+                    (window_minutes,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return 0, 0
+                return int(row[0] or 0), int(row[1] or 0)
+    except Exception as exc:
+        log.warning("reassembly_audit query skipped: %s", exc)
+        return 0, 0
+
+
 
 def _send_external_alert(title: str, details: dict) -> None:
     """Send optional external alert to webhook endpoint."""
@@ -130,13 +205,21 @@ def welding_streaming_monitor_dag():
     def check_streaming_health():
         try:
             a_count, b_count = _recent_channel_counts(HEALTH_WINDOW_MIN)
+            incomplete_count, hard_fail_count = _recent_reassembly_issues(HEALTH_WINDOW_MIN)
             log.info(
-                "Recent channel records (%s min): laser_a=%s laser_b=%s",
+                "Recent channel records (%s min): laser_a=%s laser_b=%s / reassembly: incomplete=%s hard_fail=%s",
                 HEALTH_WINDOW_MIN,
                 a_count,
                 b_count,
+                incomplete_count,
+                hard_fail_count,
             )
-            return "log_healthy_heartbeat" if (a_count > 0 and b_count > 0) else "restart_spark_streaming"
+            is_healthy = (
+                a_count > 0
+                and b_count > 0
+                and hard_fail_count <= REASSEMBLY_HARD_FAIL_THRESHOLD
+            )
+            return "log_healthy_heartbeat" if is_healthy else "restart_spark_streaming"
         except Exception as e:
             log.error(f"Health check failed: {e}")
             return "restart_spark_streaming"
@@ -144,6 +227,7 @@ def welding_streaming_monitor_dag():
     @task()
     def log_healthy_heartbeat():
         a_count, b_count = _recent_channel_counts(HEALTH_WINDOW_MIN)
+        incomplete_count, hard_fail_count = _recent_reassembly_issues(HEALTH_WINDOW_MIN)
         with psycopg2.connect(DB_CONN_STR) as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -155,7 +239,9 @@ def welding_streaming_monitor_dag():
                             "{\"status\":\"healthy\","
                             f"\"window_min\":{HEALTH_WINDOW_MIN},"
                             f"\"laser_a_count\":{a_count},"
-                            f"\"laser_b_count\":{b_count}"
+                            f"\"laser_b_count\":{b_count},"
+                            f"\"reassembly_incomplete_count\":{incomplete_count},"
+                            f"\"reassembly_hard_fail_count\":{hard_fail_count}"
                             "}"
                         ),
                     ),
@@ -172,10 +258,20 @@ def welding_streaming_monitor_dag():
 
         time.sleep(60)
         a_count, b_count = _recent_channel_counts(2)
-        log.info("Post-restart channel records (2 min): laser_a=%s laser_b=%s", a_count, b_count)
-        if not (a_count > 0 and b_count > 0):
+        incomplete_count, hard_fail_count = _recent_reassembly_issues(2)
+        log.info(
+            "Post-restart records (2 min): laser_a=%s laser_b=%s / reassembly: incomplete=%s hard_fail=%s",
+            a_count, b_count, incomplete_count, hard_fail_count,
+        )
+        if not (
+            a_count > 0
+            and b_count > 0
+            and hard_fail_count <= REASSEMBLY_HARD_FAIL_THRESHOLD
+        ):
             raise RuntimeError(
-                f"restart verify failed: laser_a={a_count}, laser_b={b_count}"
+                "restart verify failed: "
+                f"laser_a={a_count}, laser_b={b_count}, "
+                f"reassembly_hard_fail={hard_fail_count}"
             )
 
     @task(trigger_rule="one_failed")
